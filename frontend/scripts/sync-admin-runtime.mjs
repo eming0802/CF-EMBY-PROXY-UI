@@ -136,8 +136,215 @@ function materializeFrontendIndex(templateHtml = '') {
   return composeAdminRuntimeEnhancements(output);
 }
 
+function replaceRequired(source, search, replacement, label) {
+  if (!source.includes(search)) {
+    throw new Error(`admin runtime template 缺少 GET 探测契约片段：${label}`);
+  }
+  return source.replace(search, replacement);
+}
+
+function replaceAllRequired(source, search, replacement, label) {
+  if (!source.includes(search)) {
+    throw new Error(`admin runtime template 缺少 GET 探测契约片段：${label}`);
+  }
+  return source.replaceAll(search, replacement);
+}
+
+function removeRequiredRange(source, startToken, endToken, label) {
+  const startIndex = source.indexOf(startToken);
+  const endIndex = source.indexOf(endToken, startIndex + startToken.length);
+  if (startIndex < 0 || endIndex < 0) {
+    throw new Error(`admin runtime template 缺少待移除片段：${label}`);
+  }
+  if (source.indexOf(startToken, startIndex + startToken.length) >= 0) {
+    throw new Error(`admin runtime template 待移除片段不唯一：${label}`);
+  }
+  return `${source.slice(0, startIndex)}${source.slice(endIndex)}`;
+}
+
+function findCallEnd(source, callStart) {
+  const openParenIndex = source.indexOf('(', callStart);
+  if (openParenIndex < 0) return -1;
+  let depth = 0;
+  let quote = '';
+  let escaped = false;
+  for (let index = openParenIndex; index < source.length; index += 1) {
+    const char = source[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === quote) quote = '';
+      continue;
+    }
+    if (char === '"' || char === "'" || char === '`') {
+      quote = char;
+      continue;
+    }
+    if (char === '(') depth += 1;
+    if (char === ')' && --depth === 0) return index + 1;
+  }
+  return -1;
+}
+
+function removeCompiledCallContaining(source, callPrefix, anchor, label) {
+  const anchorIndex = source.indexOf(anchor);
+  const callStart = source.lastIndexOf(callPrefix, anchorIndex);
+  const callEnd = findCallEnd(source, callStart);
+  if (anchorIndex < 0 || callStart < 0 || callEnd < 0 || callEnd <= anchorIndex) {
+    throw new Error(`admin runtime template 无法定位待移除调用：${label}`);
+  }
+  if (source.indexOf(anchor, anchorIndex + anchor.length) >= 0) {
+    throw new Error(`admin runtime template 待移除调用不唯一：${label}`);
+  }
+  return `${source.slice(0, callStart)}_createCommentVNode("config snapshots removed",!0)${source.slice(callEnd)}`;
+}
+
+function stripLegacyConfigSnapshotUi(outputHtml = '') {
+  let output = String(outputHtml || '');
+  output = replaceRequired(output, ',configSnapshots:[]', '', '配置快照前端状态');
+  output = removeRequiredRange(
+    output,
+    ',SNAPSHOT_REASON_LABELS={',
+    ',RECOMMENDED_SECTION_VALUES={',
+    '配置快照原因标签'
+  );
+  output = removeRequiredRange(
+    output,
+    ',formatSnapshotReason(',
+    '}}function normalizeCloudflareWorkerScriptUploadFileName',
+    '配置快照前端方法'
+  );
+  output = replaceRequired(
+    output,
+    ',configSnapshots:Array.isArray(o.configSnapshots)?o.configSnapshots.slice():[]',
+    '',
+    '配置快照 bootstrap 缓存字段'
+  );
+  output = replaceRequired(
+    output,
+    '"configSnapshots"===r?n.configSnapshots=Array.isArray(o)?o.slice():[]:',
+    '',
+    '配置快照 bootstrap 局部更新'
+  );
+  output = replaceRequired(
+    output,
+    ',Array.isArray(o.configSnapshots)&&this.applyConfigSnapshotsState(o.configSnapshots)',
+    '',
+    '配置快照 bootstrap 应用'
+  );
+  output = replaceAllRequired(
+    output,
+    ',configSnapshots:this.configSnapshots',
+    '',
+    '配置快照 bootstrap 输出'
+  );
+  output = replaceRequired(
+    output,
+    ',snapshotsRevision:String(o.snapshotsRevision||"").trim()',
+    '',
+    '配置快照 revision'
+  );
+  output = removeCompiledCallContaining(
+    output,
+    '_createElementVNode("div",{class:"ui-settings-panel settings-block"},[',
+    'id:"cfg-snapshots-list"',
+    '配置快照设置面板'
+  );
+  const snapshotStyleMatches = output.match(/#view-settings #cfg-snapshots-list[^}]+\}/g) || [];
+  if (snapshotStyleMatches.length !== 2) {
+    throw new Error(`admin runtime template 配置快照样式数量异常：${snapshotStyleMatches.length}`);
+  }
+  output = output.replace(/#view-settings #cfg-snapshots-list[^}]+\}/g, '');
+
+  const forbiddenTokens = [
+    'configSnapshots',
+    'ConfigSnapshots',
+    'ConfigSnapshot',
+    'cfg-snapshots-list',
+    'SNAPSHOT_REASON_LABELS',
+    'snapshotsRevision'
+  ];
+  const residual = forbiddenTokens.filter((token) => output.includes(token));
+  if (residual.length) {
+    throw new Error(`admin runtime template 仍含配置快照残留：${residual.join(', ')}`);
+  }
+  return output;
+}
+
+function applyHeadProbeContract(outputHtml = '') {
+  let output = String(outputHtml || '');
+  output = replaceAllRequired(output, 'pingTimeout:5e3', 'pingTimeout:1e4', 'GET 默认超时');
+  output = replaceRequired(output, 'pingTimeout:{fallback:5e3,min:1e3,max:18e4}', 'pingTimeout:{fallback:1e4,min:1e3,max:18e4}', 'GET 超时配置边界');
+  output = replaceAllRequired(output, 'Ping \\u8d85\\u65f6', 'GET \\u8d85\\u65f6', 'GET 超时显示名');
+  output = replaceAllRequired(output, 'HEAD \\u6d4b\\u8bd5', 'GET \\u6d4b\\u8bd5', 'GET 测试显示名');
+  output = replaceAllRequired(output, 'HEAD \\u5ef6\\u8fdf', 'GET \\u5ef6\\u8fdf', 'GET 卡片延迟显示名');
+  output = replaceAllRequired(output, '\\u4e00\\u952e GET \\u6d4b\\u8bd5', '\\u5168\\u5c40 GET \\u6d4b\\u8bd5', '节点线路 GET 测试按钮');
+  output = replaceRequired(output, 'nodeModalProbePath:"/emby/system/info/public",', '', '移除节点探测路径状态');
+  output = replaceRequired(
+    output,
+    's="/emby/system/ping"===this.nodeModalProbePath?"/emby/system/ping":"/emby/system/info/public";',
+    's="/emby/system/info/public";',
+    '固定节点 GET 探测路径'
+  );
+  output = replaceAllRequired(
+    output,
+    'hedgeFailoverEnabled:!1,hedgeProbePath:',
+    'hedgeFailoverEnabled:!1,hedgeProbePreferGet:!0,hedgeProbePath:',
+    '故障转移 GET 优先默认值'
+  );
+  output = replaceRequired(
+    output,
+    '"hedgeFailoverEnabled","hedgeProbePath"',
+    '"hedgeFailoverEnabled","hedgeProbePreferGet","hedgeProbePath"',
+    '故障转移 GET 优先允许字段'
+  );
+  output = replaceRequired(
+    output,
+    '"playbackInfoCacheEnabled","videoProgressForwardEnabled","logEnabled"',
+    '"playbackInfoCacheEnabled","videoProgressForwardEnabled","hedgeProbePreferGet","logEnabled"',
+    '故障转移 GET 优先默认真布尔字段'
+  );
+  output = replaceRequired(
+    output,
+    '{key:"hedgeFailoverEnabled",id:"cfg-hedge-failover-enabled",kind:"checkbox",checkboxMode:"strictTrue"},{key:"hedgeProbePath"',
+    '{key:"hedgeFailoverEnabled",id:"cfg-hedge-failover-enabled",kind:"checkbox",checkboxMode:"strictTrue"},{key:"hedgeProbePreferGet",id:"cfg-hedge-probe-prefer-get",kind:"checkbox",checkboxMode:"defaultTrue"},{key:"hedgeProbePath"',
+    '故障转移 GET 优先表单绑定'
+  );
+  output = replaceRequired(
+    output,
+    'hedgeFailoverEnabled:"\\u7ebf\\u8def\\u6545\\u969c\\u8f6c\\u79fb",hedgeProbePath:',
+    'hedgeFailoverEnabled:"\\u7ebf\\u8def\\u6545\\u969c\\u8f6c\\u79fb",hedgeProbePreferGet:"\\u6545\\u969c\\u8f6c\\u79fb GET \\u4f18\\u5148",hedgeProbePath:',
+    '故障转移 GET 优先字段名'
+  );
+  output = replaceRequired(
+    output,
+    'statusMeta(){return this.app.getNodeLatencyMeta(this.activeLine?.latencyMs,this.app.getNodeHealthCount(this.node?.name))}',
+    'statusMeta(){return this.app.getNodeProbeMeta(this.activeLine,this.app.getNodeHealthCount(this.node?.name))}',
+    '节点卡片 GET 探测状态'
+  );
+  output = replaceAllRequired(
+    output,
+    'App.formatLatency(r.latencyMs)',
+    'App.formatNodeProbeResult(r)',
+    '节点线路 GET 探测状态'
+  );
+  output = replaceRequired(
+    output,
+    '_withDirectives(_createElementVNode("select",{"onUpdate:modelValue":r=>App.nodeModalProbePath=r,"aria-label":"HEAD \\u63a2\\u6d4b\\u8def\\u5f84",disabled:App.nodeModalPingAllPending,class:"w-full min-w-0 max-w-full rounded-xl sm:w-auto sm:min-w-[220px] border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm text-slate-700 dark:text-slate-200 outline-none focus:border-brand-400 disabled:opacity-60"},[_createElementVNode("option",{value:"/emby/system/info/public"},"/emby/system/info/public"),_createElementVNode("option",{value:"/emby/system/ping"},"/emby/system/ping")],40,["onUpdate:modelValue","disabled"]),[[_vModelSelect,App.nodeModalProbePath]]),',
+    '',
+    '移除节点 GET 探测路径下拉框'
+  );
+  output = replaceRequired(
+    output,
+    '_createElementVNode("span",null,"\\u5f00\\u542f\\u7ebf\\u8def\\u6545\\u969c\\u8f6c\\u79fb\\u3002")]),_createElementVNode("div",{class:"grid gap-3 lg:grid-cols-2"}',
+    '_createElementVNode("span",null,"\\u5f00\\u542f\\u7ebf\\u8def\\u6545\\u969c\\u8f6c\\u79fb\\u3002")]),_createElementVNode("label",{class:"flex items-start gap-3 text-sm font-medium cursor-pointer text-slate-900 dark:text-white"},[_withDirectives(_createElementVNode("input",{type:"checkbox",id:"cfg-hedge-probe-prefer-get","onUpdate:modelValue":r=>App.settingsForm.hedgeProbePreferGet=r,class:"mt-0.5 w-4 h-4 rounded"},null,8,["onUpdate:modelValue"]),[[_vModelCheckbox,App.settingsForm.hedgeProbePreferGet]]),_createElementVNode("span",null,"\\u4f18\\u5148\\u4f7f\\u7528 GET \\u8bf7\\u6c42\\u65b9\\u5f0f")]),_createElementVNode("div",{class:"grid gap-3 lg:grid-cols-2"}',
+    '故障转移 GET 优先复选框'
+  );
+  return output;
+}
+
 function composeAdminRuntimeEnhancements(outputHtml = '') {
-  const output = String(outputHtml || '')
+  const output = applyHeadProbeContract(stripLegacyConfigSnapshotUi(outputHtml))
     .replace(
     '},syncSettingsFormFromRuntimeConfig',
     "},syncReleaseSourcePreviewInSettingsForm(){const r=this.settingsForm&&typeof this.settingsForm==='object'?this.settingsForm:{};const o=String(r.githubRepo||r.releaseRepo||r.repo||'').trim();if(o&&r.githubRepo!==o)r.githubRepo=o;return o},syncSettingsFormFromRuntimeConfig"

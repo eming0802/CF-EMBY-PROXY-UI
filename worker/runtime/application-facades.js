@@ -67,7 +67,8 @@ var cacheState = {
 	ProxyFailoverStateCache: /* @__PURE__ */ new Map(),
 	CryptoKeyCache: /* @__PURE__ */ new Map(),
 	PlaybackInfoResponseCache: /* @__PURE__ */ new Map(),
-					PlaybackProgressRelay: /* @__PURE__ */ new Map(),
+	PlaybackProgressRelay: /* @__PURE__ */ new Map(),
+	MetadataPrewarmTasks: /* @__PURE__ */ new Map(),
 				DashboardMonthlyTrafficCache: /* @__PURE__ */ new Map(),
 	SingleFlightTasks: /* @__PURE__ */ new Map(),
 	AdminRemoteShellCacheMutationChains: /* @__PURE__ */ new Map(),
@@ -208,9 +209,6 @@ function remapAdminReadKvError(error, code, message, scopeBase = "admin.read") {
 	const operation = String(error?.details?.operation || "").trim().toLowerCase() === "list" ? "list" : "get";
 	return remapStructuredKvReadError(error, code, message, `${String(scopeBase || "admin.read").trim() || "admin.read"}.kv_${operation}_failed`);
 }
-function createConfigSnapshotsWriteError(code = "CONFIG_SNAPSHOTS_CLEAR_FAILED", message = "设置快照清理失败：KV 写入异常", details = null) {
-	return createStructuredConfigError(code, message, 503, details);
-}
 function logRuntimeFailure(scope, error, context = null, level = "warn") {
 	const logLevel = level === "error" ? "error" : "warn";
 	const normalizedScope = String(scope || "runtime_failure").trim() || "runtime_failure";
@@ -287,6 +285,25 @@ function serializeConfigValue(value) {
 //#region worker/core/time.js
 var nowMs = () => Date.now();
 var sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+function createCancelableDelay(ms) {
+	let settled = false;
+	let resolveDelay = () => {};
+	const timerId = setTimeout(() => {
+		if (settled) return;
+		settled = true;
+		resolveDelay(true);
+	}, Math.max(0, Number(ms) || 0));
+	return {
+		promise: new Promise((resolve) => { resolveDelay = resolve; }),
+		cancel() {
+			if (settled) return false;
+			settled = true;
+			clearTimeout(timerId);
+			resolveDelay(false);
+			return true;
+		}
+	};
+}
 //#endregion
 //#region worker/features/config/api.js
 var AUTH_DEFAULTS = Object.freeze({
@@ -367,8 +384,9 @@ var SCHEDULE_DEFAULTS = Object.freeze({
 	TgDailyReportClockTimes: ["09:00"]
 });
 var PROXY_DEFAULTS = Object.freeze({
-	PingTimeoutMs: 5e3,
+	PingTimeoutMs: 1e4,
 	HedgeFailoverEnabled: false,
+	HedgeProbePreferGet: true,
 	HedgeProbePath: "/emby/system/ping",
 	HedgeProbeTimeoutMs: 2500,
 	HedgeProbeParallelism: 2,
@@ -388,9 +406,8 @@ var PROXY_DEFAULTS = Object.freeze({
 	DefaultPlaybackInfoMode: "passthrough",
 	DefaultRealClientIpMode: "forward",
 	DefaultMediaAuthMode: "auto",
-			});
+	});
 var DNS_DEFAULTS = Object.freeze({
-	ConfigSnapshotLimit: 5,
 	DnsHistoryLimit: 5,
 	DnsIpProbeCacheTtlSec: 600,
 	DnsIpProbeTimeoutMs: 2500,
@@ -405,8 +422,8 @@ var CLOUDFLARE_DEFAULTS = Object.freeze({
 	CfQuotaPlanOverride: ""
 });
 var BUILD_DEFAULTS = Object.freeze({
-	AssetHash: "v19.3",
-	Version: "19.3"
+	AssetHash: "v19.4",
+	Version: "19.4"
 });
 var CONFIG_DEFAULTS = Object.freeze({
 	...AUTH_DEFAULTS,
@@ -1551,8 +1568,17 @@ function buildDnsIpWorkspaceSummary(currentHostItems = [], sharedPoolItems = [])
 }
 //#endregion
 //#region worker/features/dns/hostname-model.js
+function normalizeHostPrefixDnsHostname(value = "") {
+	const rawText = String(value || "").trim().toLowerCase();
+	if (!rawText) return "";
+	const text = rawText.endsWith(".") ? rawText.slice(0, -1) : rawText;
+	if (!text || text.length > 253 || text.endsWith(".")) return "";
+	if (/\s|[:\/@*?#\\]/.test(text) || isValidIpv4Address(text) || isValidIpv6Address(text)) return "";
+	if (text.split(".").some((label) => !isValidDnsLabelForHostPrefix(label))) return "";
+	return text;
+}
 function resolveConfiguredHost(env) {
-	return normalizeHostnameText(env?.HOST);
+	return normalizeHostPrefixDnsHostname(env?.HOST);
 }
 function resolveConfiguredLegacyHost(env) {
 	return normalizeHostnameText(env?.LEGACY_HOST);
@@ -1731,23 +1757,35 @@ function assertAdminIndexSourceConfigValid(rawConfig = {}) {
 	throw createStructuredConfigError("ADMIN_INDEX_SOURCE_UPLOAD_ONLY", "管理台 HTML 仅支持本地上传，请通过启动门或 Worker 和 HTML 更新面板提交 index.html", 400, { field: "indexUrl" });
 }
 function buildHostPrefixRuntimeRequirementState(config = {}, env = null) {
+	const rawHost = String(env?.HOST || "").trim();
 	const host = resolveConfiguredHost(env);
 	const cfZoneId = String(config?.cfZoneId || "").trim();
 	const cfApiToken = String(config?.cfApiToken || "").trim();
 	const missingFields = [];
-	if (!host) missingFields.push("HOST");
+	const invalidFields = [];
+	if (!rawHost) missingFields.push("HOST");
+	else if (!host) invalidFields.push("HOST");
 	if (!cfZoneId) missingFields.push("cfZoneId");
 	if (!cfApiToken) missingFields.push("cfApiToken");
 	return {
 		host,
 		cfZoneId,
 		cfApiToken,
-		missingFields
+		missingFields,
+		invalidFields
 	};
+}
+function assertHostPrefixRuntimeHostValid(requirementState = {}) {
+	if (!Array.isArray(requirementState?.invalidFields) || !requirementState.invalidFields.includes("HOST")) return;
+	throw createStructuredConfigError("HOST_PREFIX_HOST_INVALID", "HOST 必须是合法 DNS 主机名，不能包含协议、用户信息、端口、路径、通配符、下划线、空标签或 IP 地址", 400, {
+		field: "HOST",
+		reason: "invalid_hostname"
+	});
 }
 function assertHostPrefixProxyConfigReady(config = {}, env = null) {
 	if (config?.enableHostPrefixProxy !== true) return;
 	const requirementState = buildHostPrefixRuntimeRequirementState(config, env);
+	assertHostPrefixRuntimeHostValid(requirementState);
 	if (requirementState.missingFields.length <= 0) return;
 	throw createStructuredConfigError("HOST_PREFIX_PROXY_CONFIG_REQUIRED", "启用域名前缀代理前，必须先配置 HOST、Cloudflare Zone ID 和 API 令牌", 400, {
 		missingFields: requirementState.missingFields,
@@ -1756,11 +1794,17 @@ function assertHostPrefixProxyConfigReady(config = {}, env = null) {
 }
 function assertHostPrefixDnsSyncReady(config = {}, env = null) {
 	const requirementState = buildHostPrefixRuntimeRequirementState(config, env);
+	assertHostPrefixRuntimeHostValid(requirementState);
 	if (requirementState.missingFields.length <= 0) return requirementState;
 	throw createStructuredConfigError("HOST_PREFIX_DNS_CONFIG_REQUIRED", "保存域名前缀节点前，必须先配置 HOST、Cloudflare Zone ID 和 API 令牌", 400, {
 		missingFields: requirementState.missingFields,
 		host: requirementState.host
 	});
+}
+function assertPreparedHostPrefixDnsSyncReady(mutations = [], config = {}, env = null) {
+	const list = Array.isArray(mutations) ? mutations : [mutations];
+	if (!list.some((mutation) => isHostPrefixEntryMode(mutation?.nextNode?.entryMode))) return null;
+	return assertHostPrefixDnsSyncReady(config, env);
 }
 //#endregion
 //#region worker/features/proxy/constants.js
@@ -1806,7 +1850,39 @@ var DEFAULT_PLAYBACK_ROUTE_HOT_CACHE_TTL_MS = CACHE_DEFAULTS.PlaybackRouteHotCac
 var DEFAULT_PLAYBACK_ROUTE_HOT_CACHE_MAX = CACHE_DEFAULTS.PlaybackRouteHotCacheMax;
 var ADMIN_JSON_REQUEST_MAX_BYTES = 12 * 1024 * 1024;
 var ADMIN_FULL_BACKUP_MAX_REQUEST_BYTES = ADMIN_JSON_REQUEST_MAX_BYTES - 64 * 1024;
+var D1_TEXT_VALUE_MAX_BYTES = 2e6;
+var D1_SAFE_SERIALIZED_VALUE_MAX_BYTES = 19e5;
+var D1_LIKE_PATTERN_MAX_BYTES = 50;
 var METADATA_PREWARM_RESPONSE_MAX_BYTES = 512 * 1024;
+var METADATA_PREWARM_MAX_IN_FLIGHT = 4;
+var METADATA_PREWARM_MAX_PREFETCH_BYTES = 8 * 1024 * 1024;
+var NODE_RECORD_MAX_BYTES = 256 * 1024;
+var NODE_LINE_MAX = 32;
+var NODE_HEADER_MAX = 64;
+var NODE_HEADER_TOTAL_MAX_BYTES = 64 * 1024;
+var NODE_HEADER_KEY_MAX_BYTES = 128;
+var NODE_HEADER_VALUE_MAX_BYTES = 8 * 1024;
+var NODE_TEXT_FIELD_MAX_BYTES = 4 * 1024;
+var NODE_BOUNDED_TEXT_FIELDS = Object.freeze(["displayName", "remark", "tag", "tagColor", "remarkColor", "secret", "hostPrefixCnameTarget", "hedgeProbePath"]);
+var D1_TIDY_BATCH_SIZE = 500;
+var D1_TIDY_ROW_LIMIT = 1e4;
+var D1_TIDY_TIME_LIMIT_MS = 25e3;
+var D1_TIDY_PREVIEW_COUNT_LIMIT = 1e4;
+var D1_TIDY_FTS_REBUILD_LOG_LIMIT = 1e4;
+var D1_SCHEMA_REPAIR_ROW_LIMIT = 1e4;
+var D1_SCHEMA_REPAIR_TOKEN_TTL_MS = 10 * 60 * 1e3;
+var D1_SCHEMA_REPAIR_LEASE_MS = 2 * 60 * 1e3;
+var D1_SCHEMA_CONTRACT_VERSION = 2;
+var D1_SCHEMA_REPAIR_PLAN_VERSION = 2;
+
+function normalizeSqliteTypeAffinity(type = "") {
+	const normalized = String(type || "").trim().toUpperCase();
+	if (normalized.includes("INT")) return "INTEGER";
+	if (normalized.includes("CHAR") || normalized.includes("CLOB") || normalized.includes("TEXT")) return "TEXT";
+	if (normalized.includes("REAL") || normalized.includes("FLOA") || normalized.includes("DOUB")) return "REAL";
+	if (!normalized || normalized.includes("BLOB")) return "BLOB";
+	return "NUMERIC";
+}
 
 var IMAGE_FILE_EXTENSION_REGEX = /\.(?:jpg|jpeg|gif|png|svg|ico|webp)$/i;
 var STATIC_ASSET_EXTENSION_REGEX = /\.(?:js|css|woff2?|ttf|otf|map|webmanifest)$/i;
@@ -5165,20 +5241,6 @@ var CONFIG_LEGACY_MIGRATION_SOURCE_FIELDS = [
 	...CONFIG_RETIRED_ALIAS_SOURCE_FIELDS,
 	...CONFIG_PROTOCOL_STRATEGY_LEGACY_FIELDS
 ];
-var CONFIG_SNAPSHOT_CHANGED_KEY_MIGRATIONS = {
-	directSourceNodes: ["sourceDirectNodes"],
-	nodeDirectList: ["sourceDirectNodes"],
-	logIncludeClientIp: ["logWriteClientIp", "logDisplayClientIp"],
-	logIncludeColo: ["logWriteColo", "logDisplayColo"],
-	logIncludeUa: ["logWriteUa", "logDisplayUa"],
-	playbackInfoAutoProxy: ["defaultPlaybackInfoMode"],
-	playbackInfoBlockWangpanProxy: ["defaultPlaybackInfoMode"],
-	enableH2: ["protocolStrategy"],
-	enableH3: ["protocolStrategy"],
-	peakDowngrade: ["protocolStrategy"],
-	tgDailyReportTime: ["tgDailyReportClockTimes"]
-};
-var CONFIG_LEGACY_SNAPSHOT_DROP_KEY_SET = /* @__PURE__ */ new Set([...CONFIG_RETIRED_FIELD_KEYS, ...CONFIG_RETIRED_ALIAS_SOURCE_FIELDS]);
 var CONFIG_SANITIZE_RULES = {
 	allowedFields: [
 		"uiRadiusPx",
@@ -5212,6 +5274,7 @@ var CONFIG_SANITIZE_RULES = {
 		"pingTimeout",
 		"pingCacheMinutes",
 		"hedgeFailoverEnabled",
+		"hedgeProbePreferGet",
 		"hedgeProbePath",
 		"hedgeProbeTimeoutMs",
 		"hedgeProbeParallelism",
@@ -5434,7 +5497,7 @@ var CONFIG_SANITIZE_RULES = {
 		prewarmPrefetchBytes: {
 			fallback: Config.Defaults.PrewarmPrefetchBytes,
 			min: 0,
-			max: 64 * 1024 * 1024
+			max: METADATA_PREWARM_MAX_PREFETCH_BYTES
 		},
 		playbackInfoCacheTtlSec: {
 			fallback: Config.Defaults.PlaybackInfoCacheTtlSec,
@@ -5462,6 +5525,7 @@ var CONFIG_SANITIZE_RULES = {
 		"enablePrewarm",
 		"playbackInfoCacheEnabled",
 		"videoProgressForwardEnabled",
+		"hedgeProbePreferGet",
 		"logEnabled",
 		"logWriteClientIp",
 		"logWriteColo",
@@ -5702,49 +5766,10 @@ function assertExpectedRuntimeConfigRevision(expectedRevision = "", currentConfi
 	const expectedHash = normalizedExpectedRevision.split(".").pop() || "";
 	const currentHash = hashStableText(serializeConfigValue(sanitizeRuntimeConfig(currentConfig)));
 	if (expectedHash === currentHash) return;
-	throw createStructuredConfigError("CONFIG_REVISION_CONFLICT", "配置已被其他设备更新，请刷新设置后重新提交", 409, {
+	throw createStructuredConfigError("CONFIG_REVISION_CONFLICT", "配置版本已变化，请刷新设置后重新提交", 409, {
 		expectedRevision: normalizedExpectedRevision,
 		currentHash
 	});
-}
-function redactConfigSnapshotSecrets(snapshot = {}) {
-	if (!isPlainObject(snapshot)) return snapshot;
-	const redacted = {
-		...snapshot,
-		config: redactRuntimeConfigSecrets(snapshot.config || {})
-	};
-	if (isPlainObject(snapshot.rollbackPayload) && Array.isArray(snapshot.rollbackPayload.kvEntries)) redacted.rollbackPayload = {
-		...snapshot.rollbackPayload,
-		kvEntries: snapshot.rollbackPayload.kvEntries.map((entry) => {
-			if (!isPlainObject(entry) || entry.exists !== true) return entry;
-			const key = String(entry.key || "");
-			if (key === "sys:config_snapshots:v1") try {
-				const snapshots = JSON.parse(String(entry.value || "[]"));
-				return {
-					...entry,
-					value: JSON.stringify(Array.isArray(snapshots) ? snapshots.map((item) => redactConfigSnapshotSecrets(item)) : [])
-				};
-			} catch {
-				return {
-					...entry,
-					value: JSON.stringify([])
-				};
-			}
-			if (key !== "sys:theme") return entry;
-			try {
-				return {
-					...entry,
-					value: JSON.stringify(redactRuntimeConfigSecrets(JSON.parse(String(entry.value || "{}"))))
-				};
-			} catch {
-				return {
-					...entry,
-					value: JSON.stringify({})
-				};
-			}
-		})
-	};
-	return redacted;
 }
 function collectLegacyRuntimeConfigState(input = {}) {
 	const migrationState = migrateRuntimeConfigLegacyAliases(input);
@@ -5763,60 +5788,6 @@ function migrateLegacyRuntimeConfig(input = {}) {
 		deletedLegacyFieldCount: migrationState.deletedLegacyFieldCount,
 		migratedConfigKeys: migrationState.migratedConfigKeys,
 		migratedKeyMap: migrationState.migratedKeyMap
-	};
-}
-function normalizeConfigSnapshotChangedKeys(changedKeys = []) {
-	const normalizedChangedKeys = [];
-	const removedLegacyKeys = [];
-	const seen = /* @__PURE__ */ new Set();
-	for (const rawKey of Array.isArray(changedKeys) ? changedKeys : []) {
-		const key = String(rawKey || "").trim();
-		if (!key) continue;
-		const mappedKeys = CONFIG_SNAPSHOT_CHANGED_KEY_MIGRATIONS[key];
-		if (Array.isArray(mappedKeys) && mappedKeys.length) {
-			removedLegacyKeys.push(key);
-			for (const mappedKey of mappedKeys) {
-				if (!mappedKey || seen.has(mappedKey)) continue;
-				seen.add(mappedKey);
-				normalizedChangedKeys.push(mappedKey);
-			}
-			continue;
-		}
-		if (CONFIG_LEGACY_SNAPSHOT_DROP_KEY_SET.has(key)) {
-			removedLegacyKeys.push(key);
-			continue;
-		}
-		if (seen.has(key)) continue;
-		seen.add(key);
-		normalizedChangedKeys.push(key);
-	}
-	return {
-		changedKeys: normalizedChangedKeys,
-		removedLegacyKeys: normalizeDistinctConfigKeyList(removedLegacyKeys)
-	};
-}
-function rewriteConfigSnapshotToCurrentSchema(snapshot) {
-	if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return {
-		snapshot,
-		rewritten: false,
-		deletedLegacyFieldCount: 0,
-		migratedConfigKeys: []
-	};
-	const configMigration = migrateLegacyRuntimeConfig(snapshot.config && typeof snapshot.config === "object" && !Array.isArray(snapshot.config) ? snapshot.config : {});
-	const changedKeyMigration = normalizeConfigSnapshotChangedKeys(snapshot.changedKeys);
-	const nextSnapshot = {
-		...snapshot,
-		changedKeys: changedKeyMigration.changedKeys,
-		changeCount: changedKeyMigration.changedKeys.length,
-		config: configMigration.cleanedConfig
-	};
-	const previousChangedKeys = Array.isArray(snapshot.changedKeys) ? snapshot.changedKeys : [];
-	const previousChangeCount = Number(snapshot.changeCount) || previousChangedKeys.length || 0;
-	return {
-		snapshot: nextSnapshot,
-		rewritten: serializeConfigValue(snapshot.config || {}) !== serializeConfigValue(nextSnapshot.config) || serializeConfigValue(previousChangedKeys) !== serializeConfigValue(nextSnapshot.changedKeys) || previousChangeCount !== nextSnapshot.changeCount,
-		deletedLegacyFieldCount: configMigration.deletedLegacyFieldCount + changedKeyMigration.removedLegacyKeys.length,
-		migratedConfigKeys: configMigration.migratedConfigKeys
 	};
 }
 function buildRevisionValue(hash = "", updatedAt = "") {
@@ -5861,6 +5832,7 @@ function createTidyPreviewGroup(key = "", label = "", values = [], options = {})
 		key: String(key || "").trim(),
 		label: String(label || "").trim(),
 		count,
+		countIsLowerBound: options.countIsLowerBound === true,
 		samples,
 		truncated: count > samples.length,
 		note
@@ -5880,7 +5852,6 @@ function buildKvTidyFieldGroups(payload = {}) {
 	if (configFieldTargets.length > 0) {
 		const configNoteParts = [];
 		if (payload.sourceDirectNodesFromLegacyNodes === true) configNoteParts.push("包含节点遗留直连标记折叠进 sourceDirectNodes");
-		if (Number(payload.rewrittenSnapshotCount) > 0) configNoteParts.push(`会同步迁移 ${Math.max(0, Math.floor(Number(payload.rewrittenSnapshotCount) || 0))} 份旧快照中的相关配置字段`);
 		fieldGroups.push(createTidyPreviewGroup("config_current_fields", "全局设置当前字段", configFieldTargets, {
 			count: configFieldTargets.length,
 			note: configNoteParts.join("；") || "会把旧版配置别名收敛到当前 schema。"
@@ -5982,6 +5953,9 @@ function classifyCloudflareAnalyticsError(message, options = {}) {
 	};
 	return result;
 }
+async function readRuntimeConfigFromKv(kv) {
+	return sanitizeRuntimeConfig(await kv.get("sys:theme", { type: "json" }) || {});
+}
 async function getRuntimeConfig(env) {
 	const kv = getKvBinding(env);
 	if (!kv) return {};
@@ -6000,7 +5974,7 @@ async function getRuntimeConfig(env) {
 		const staleConfig = activeCache?.data && typeof activeCache.data === "object" ? activeCache.data : cachedConfig?.data && typeof cachedConfig.data === "object" ? cachedConfig.data : null;
 		let config = staleConfig || {};
 		try {
-			config = sanitizeRuntimeConfig(await kv.get("sys:theme", { type: "json" }) || {});
+			config = await readRuntimeConfigFromKv(kv);
 		} catch (error) {
 			const hasCachedConfig = staleConfig && typeof staleConfig === "object";
 			logRuntimeFailure("runtime_config.load_failed", error, {
@@ -6021,7 +5995,7 @@ async function getRuntimeConfig(env) {
 async function getRuntimeConfigStrict(env) {
 	const kv = getKvBinding(env);
 	if (!kv) return {};
-	return sanitizeRuntimeConfig(await kvGetStrict(kv, "sys:theme", { type: "json" }) || {});
+	return await readRuntimeConfigFromKv(kv);
 }
 //#endregion
 //#region worker/features/admin/shell-views.js
@@ -6149,7 +6123,7 @@ function defineAdminShellViews(dependencies = {}, shell = {}) {
 	function renderLandingPage(env, initHealth = buildInitHealth(env)) {
 		const adminPath = getAdminPath(env);
 		const initBanner = initHealth.ok ? "" : `<div class="landing-banner"><div class="landing-banner-title">系统未初始化</div><div class="landing-banner-text">缺少关键环境变量：${initHealth.missing.map((item) => escapeHtml(item)).join("、")}</div></div>`;
-		const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="/favicon.ico" sizes="any"><title>Emby Proxy V19.3</title>${shell.LANDING_PAGE_STYLE_HTML}</head><body><main class="landing-shell"><section class="landing-card"><div class="landing-grid"><div class="landing-primary">${initBanner}<div class="landing-pill">Headless Edge Relay</div><h1 class="landing-title">Emby Proxy V19.3</h1><p class="landing-text">为了极致优化视频代理性能，根路径默认只保留无头中继与说明壳；真正的管理台入口固定收口到 <span class="landing-highlight">${escapeHtml(adminPath)}</span>，并由 Worker 读取随部署发布或已上传的 <code>index.html</code> 返回。</p><div class="landing-actions"><a href="${escapeHtml(adminPath)}" class="landing-btn landing-btn-primary">访问 ${escapeHtml(adminPath)}</a><a href="https://github.com/axuitomo/CF-EMBY-PROXY-UI" target="_blank" rel="noopener noreferrer" class="landing-btn landing-btn-secondary">查看项目说明</a></div></div><div class="landing-side"><div class="landing-notes"><div class="landing-notes-title">Routing Notes</div><ul class="landing-note-list"><li>根路径仅提供静态说明页，不承载实时配置数据。</li><li><code>${escapeHtml(adminPath)}</code> 只负责返回管理台壳与 bootstrap，动态数据继续走 <code>POST ${escapeHtml(adminPath)}</code> API。</li><li>正式真相源固定为 <code>frontend/</code>、<code>worker.js</code> 与 <code>worker.md</code>。</li><li>媒体代理、日志与 KV / D1 逻辑保持原 Worker 主链路不变。</li></ul></div></div></div></section></main></body></html>`;
+		const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="/favicon.ico" sizes="any"><title>Emby Proxy V19.4</title>${shell.LANDING_PAGE_STYLE_HTML}</head><body><main class="landing-shell"><section class="landing-card"><div class="landing-grid"><div class="landing-primary">${initBanner}<div class="landing-pill">Headless Edge Relay</div><h1 class="landing-title">Emby Proxy V19.4</h1><p class="landing-text">为了极致优化视频代理性能，根路径默认只保留无头中继与说明壳；真正的管理台入口固定收口到 <span class="landing-highlight">${escapeHtml(adminPath)}</span>，并由 Worker 读取随部署发布或已上传的 <code>index.html</code> 返回。</p><div class="landing-actions"><a href="${escapeHtml(adminPath)}" class="landing-btn landing-btn-primary">访问 ${escapeHtml(adminPath)}</a><a href="https://github.com/axuitomo/CF-EMBY-PROXY-UI" target="_blank" rel="noopener noreferrer" class="landing-btn landing-btn-secondary">查看项目说明</a></div></div><div class="landing-side"><div class="landing-notes"><div class="landing-notes-title">Routing Notes</div><ul class="landing-note-list"><li>根路径仅提供静态说明页，不承载实时配置数据。</li><li><code>${escapeHtml(adminPath)}</code> 只负责返回管理台壳与 bootstrap，动态数据继续走 <code>POST ${escapeHtml(adminPath)}</code> API。</li><li>正式真相源固定为 <code>frontend/</code>、<code>worker.js</code> 与 <code>worker.md</code>。</li><li>媒体代理、日志与 KV / D1 逻辑保持原 Worker 主链路不变。</li></ul></div></div></div></section></main></body></html>`;
 		const headers = new Headers({
 			"Content-Type": "text/html;charset=UTF-8",
 			"Cache-Control": "public, max-age=3600, s-maxage=86400"
@@ -7658,8 +7632,6 @@ function pickCloudflareWorkerScriptCandidate(candidates = [], requestHost = "", 
 		filteredCandidates.sort((left, right) => Number(right.exactHostname) - Number(left.exactHostname) || Number(right.exactPath) - Number(left.exactPath) || Number(right.score || 0) - Number(left.score || 0) || String(left.hostname || "").length - String(right.hostname || "").length || String(left.scriptName || "").localeCompare(String(right.scriptName || "")));
 		return filteredCandidates[0];
 	}
-	const uniqueScriptNames = [...new Set((Array.isArray(candidates) ? candidates : []).map((candidate) => String(candidate?.scriptName || "").trim()).filter(Boolean))];
-	if (uniqueScriptNames.length === 1) return (Array.isArray(candidates) ? candidates : []).find((candidate) => String(candidate?.scriptName || "").trim() === uniqueScriptNames[0]) || null;
 	return null;
 }
 async function listCloudflareWorkerPlacementRegions(accountId, apiToken) {
@@ -7719,8 +7691,7 @@ async function resolveCloudflareWorkerScriptContext({ cfAccountId, cfZoneId, cfA
 			zoneId: cfZoneId,
 			hostname: requestHost
 		},
-		{ hostname: requestHost },
-		{ zoneId: cfZoneId }
+		{ hostname: requestHost }
 	];
 	for (const query of domainQueries) {
 		const querySignature = JSON.stringify({
@@ -8132,10 +8103,8 @@ function defineDashboardActions(dependencies = {}, actions = {}) {
 			try {
 				const config = await getRuntimeConfigStrict(env);
 				const initHealth = buildInitHealth(env);
-				const [nodes, configSnapshots, storedSnapshots, runtimeStatusPayload] = await Promise.all([
+				const [nodes, runtimeStatusPayload] = await Promise.all([
 					CacheManager.getNodesListStrict(env, ctx),
-					kernel.getConfigSnapshotsForRead(kv),
-					kernel.readStoredConfigSnapshotsStrict(kv),
 					kernel.getRuntimeStatusPayload(env, {
 						ctx,
 						kv,
@@ -8150,8 +8119,7 @@ function defineDashboardActions(dependencies = {}, actions = {}) {
 				}, {
 					ctx,
 					config,
-					nodes,
-					snapshots: storedSnapshots
+					nodes
 				});
 				return jsonResponse({
 					adminPath: getAdminPath(env),
@@ -8162,7 +8130,6 @@ function defineDashboardActions(dependencies = {}, actions = {}) {
 					legacyHost: resolveConfiguredLegacyHost(env),
 					contract: buildAdminUiContract(),
 					nodes,
-					configSnapshots,
 					shell: buildAdminShellState(env, initHealth, config),
 										runtimeStatus: runtimeStatusPayload?.status && typeof runtimeStatusPayload.status === "object" ? runtimeStatusPayload.status : withAdminShellRuntimeStatus({}, env, config, initHealth),
 					revisions,
@@ -8180,19 +8147,12 @@ function defineDashboardActions(dependencies = {}, actions = {}) {
 				throw remapAdminReadKvError(error, "SETTINGS_BOOTSTRAP_READ_FAILED", "设置页加载失败：KV 读取异常", "admin.read.settings_bootstrap");
 			}
 			let nodes = [];
-			let configSnapshots = [];
-			let storedSnapshots = [];
 			let runtimeStatus = {};
 			let revisions = {};
 			try {
 				nodes = await CacheManager.getNodesListStrict(env, ctx);
 			} catch (error) {
 				console.warn("[settings_bootstrap.nodes_degraded]", getErrorMessage(error));
-			}
-			try {
-				[configSnapshots, storedSnapshots] = await Promise.all([kernel.getConfigSnapshotsForRead(kv), kernel.readStoredConfigSnapshotsStrict(kv)]);
-			} catch (error) {
-				console.warn("[settings_bootstrap.snapshots_degraded]", getErrorMessage(error));
 			}
 			try {
 				const runtimeStatusPayload = await kernel.getRuntimeStatusPayload(env, {
@@ -8213,8 +8173,7 @@ function defineDashboardActions(dependencies = {}, actions = {}) {
 				}, {
 					ctx,
 					config,
-					nodes,
-					snapshots: storedSnapshots
+					nodes
 				});
 			} catch (error) {
 				console.warn("[settings_bootstrap.revisions_degraded]", getErrorMessage(error));
@@ -8225,7 +8184,6 @@ function defineDashboardActions(dependencies = {}, actions = {}) {
 				legacyHost: resolveConfiguredLegacyHost(env),
 				contract: buildAdminUiContract(),
 				nodes,
-				configSnapshots,
 								runtimeStatus: withAdminShellRuntimeStatus(runtimeStatus, env, config, buildInitHealth(env)),
 				revisions,
 				generatedAt: (/* @__PURE__ */ new Date()).toISOString()
@@ -8627,28 +8585,24 @@ function defineConfigActions(dependencies = {}, actions = {}) {
 				})
 			});
 		},
-		async saveConfig(data, { env, ctx, kv, meta }) {
+		async saveConfig(data, { env, ctx, kv }) {
 			if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace", 503);
 			const currentConfig = await getRuntimeConfigStrict(env);
-			assertExpectedRuntimeConfigRevision(data?.expectedConfigRevision, currentConfig);
 			const savedConfig = data.config ? await kernel.persistRuntimeConfig(mergeAdminSettingsRuntimeConfig(data.config, currentConfig), {
 				env,
 				kv,
 				ctx,
-				snapshotMeta: {
-					reason: "save_config",
-					section: String(meta?.section || "all"),
-					source: String(meta?.source || "ui"),
-					actor: "admin"
-				}
+				expectedConfigRevision: data?.expectedConfigRevision,
+				mutationId: data?.mutationId,
+				forceKvCommit: true
 			}) : currentConfig;
+			const revisions = await kernel.getAdminRevisions(env, { ctx, config: savedConfig });
 			return jsonResponse({
 				success: true,
+				committed: true,
 				config: redactAdminRuntimeConfig(savedConfig),
-								revisions: await kernel.getAdminRevisions(env, {
-					ctx,
-					config: savedConfig
-				})
+				revision: String(revisions.configRevision || ""),
+				revisions
 			});
 		},
 		async uploadAdminIndex(data, { env, ctx, kv }) {
@@ -8730,7 +8684,7 @@ function defineConfigActions(dependencies = {}, actions = {}) {
 				containsSecrets: includeSecrets === true
 			});
 		},
-		async importSettings(data, { env, ctx, kv, meta }) {
+		async importSettings(data, { env, ctx, kv }) {
 			if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace", 503);
 			const importedConfig = data?.config && typeof data.config === "object" && !Array.isArray(data.config) ? data.config : data?.settings && typeof data.settings === "object" && !Array.isArray(data.settings) ? data.settings : null;
 			if (!importedConfig) return jsonError("INVALID_SETTINGS_BACKUP", "设置备份文件无效，缺少 config/settings 对象");
@@ -8739,40 +8693,20 @@ function defineConfigActions(dependencies = {}, actions = {}) {
 				env,
 				kv,
 				ctx,
-				snapshotMeta: {
-					reason: "import_settings",
-					section: String(meta?.section || "settings"),
-					source: String(meta?.source || "settings_backup"),
-					actor: "admin"
-				}
+				forceKvCommit: true
 			});
-			const [configSnapshots, revisions] = await Promise.all([kernel.getConfigSnapshotsForRead(kv), kernel.getAdminRevisions(env, {
+			const revisions = await kernel.getAdminRevisions(env, {
 				ctx,
 				config: savedConfig
-			})]);
+			});
 			return jsonResponse({
 				success: true,
 				config: redactAdminRuntimeConfig(savedConfig),
-				configSnapshots,
 				revisions,
 				generatedAt: (/* @__PURE__ */ new Date()).toISOString()
 			});
 		},
-		async getConfigSnapshots(data, { env, kv, db, ctx }) {
-			const snapshots = await kernel.getConfigSnapshotsForRead(kv);
-			const storedSnapshots = await kernel.readStoredConfigSnapshotsStrict(kv);
-			return jsonResponse({
-				snapshots,
-				revisions: await kernel.getAdminRevisionsForRead({
-					env,
-					kv,
-					db
-				}, {
-					ctx,
-					snapshots: storedSnapshots
-				})
-			});
-		}
+
 	};
 }
 //#endregion
@@ -8781,82 +8715,6 @@ function defineBackupActions(dependencies = {}, actions = {}) {
 	const { kernel } = dependencies;
 	const { CacheManager, Logger } = dependencies;
 	return {
-		async clearConfigSnapshots(data, { kv }) {
-			const snapshotsKey = kernel.CONFIG_SNAPSHOTS_KEY;
-			const snapshotsMetaKey = kernel.CONFIG_SNAPSHOTS_META_KEY;
-			try {
-				await kernel.clearConfigSnapshots(kv);
-			} catch (error) {
-				const structuredError = createConfigSnapshotsWriteError("CONFIG_SNAPSHOTS_CLEAR_FAILED", "设置快照清理失败：KV 写入异常", {
-					dependency: "KV",
-					phase: "clear",
-					clearApplied: false,
-					snapshotsKey,
-					snapshotsMetaKey,
-					reason: getErrorMessage(error)
-				});
-				logRuntimeFailure("admin.write.config_snapshots.clear_failed", structuredError, structuredError.details);
-				throw structuredError;
-			}
-			try {
-				return jsonResponse({
-					success: true,
-					snapshots: [],
-					revisions: await kernel.getAdminRevisions(kv, { snapshots: [] })
-				});
-			} catch (error) {
-				const structuredError = createConfigSnapshotsWriteError("CONFIG_SNAPSHOTS_REVISIONS_REFRESH_FAILED", "设置快照已清理，但版本信息刷新失败", {
-					...isStructuredKvReadError(error) && isPlainObject(error?.details) ? error.details : {},
-					phase: "refresh_revisions",
-					clearApplied: true,
-					reason: getErrorMessage(error)
-				});
-				logRuntimeFailure("admin.write.config_snapshots.revisions_refresh_failed", structuredError, structuredError.details);
-				throw structuredError;
-			}
-		},
-		async restoreConfigSnapshot(data, { env, ctx, kv }) {
-			const snapshotId = String(data?.id || "").trim();
-			if (!snapshotId) return jsonError("SNAPSHOT_ID_REQUIRED", "请提供要恢复的快照 ID");
-			const snapshot = await kernel.getConfigSnapshotById(kv, snapshotId);
-			if (!snapshot) return jsonError("SNAPSHOT_NOT_FOUND", "指定的配置快照不存在", 404);
-			const currentConfig = await getRuntimeConfigStrict(env);
-			const restoredSnapshotConfig = preserveRuntimeConfigSecrets(snapshot.config || {}, currentConfig);
-			const restoredIndexRevision = parseAdminLocalIndexSourceUrl(restoredSnapshotConfig.indexUrl || "");
-			const restoredIndexRecord = restoredIndexRevision ? await kernel.getAdminIndexUploadRecord(kv, restoredIndexRevision) : null;
-			if (restoredIndexRevision && !restoredIndexRecord) return jsonError("SNAPSHOT_ADMIN_INDEX_MISSING", "配置快照引用的 index.html 已不存在", 409, { revision: restoredIndexRevision });
-			const previousActiveIndexValue = await kv.get(kernel.ADMIN_ACTIVE_INDEX_KEY);
-			if (restoredIndexRecord) await kv.put(kernel.ADMIN_ACTIVE_INDEX_KEY, JSON.stringify(restoredIndexRecord));
-			else await kv.delete(kernel.ADMIN_ACTIVE_INDEX_KEY);
-			let savedConfig;
-			try {
-				savedConfig = await kernel.persistRuntimeConfig(restoredSnapshotConfig, {
-					env,
-					kv,
-					ctx,
-					snapshotMeta: {
-						reason: "restore_snapshot",
-						section: "all",
-						source: "snapshot",
-						actor: "admin",
-						note: snapshotId
-					}
-				});
-			} catch (error) {
-				if (previousActiveIndexValue === null) await kv.delete(kernel.ADMIN_ACTIVE_INDEX_KEY);
-				else await kv.put(kernel.ADMIN_ACTIVE_INDEX_KEY, previousActiveIndexValue);
-				throw error;
-			}
-			return jsonResponse({
-				success: true,
-				config: redactAdminRuntimeConfig(savedConfig),
-				restoredSnapshotId: snapshotId,
-				revisions: await kernel.getAdminRevisions(env, {
-					ctx,
-					config: savedConfig
-				})
-			});
-		},
 		async list(data, { env, ctx, kv, db }) {
 			try {
 				const nodes = await CacheManager.getNodesListStrict(env, ctx);
@@ -8908,9 +8766,11 @@ function defineBackupActions(dependencies = {}, actions = {}) {
 				name: nodeName.toLowerCase(),
 				...node
 			};
+			const resourceWarning = buildNodeResourceWarning(nodeName, node);
 			return jsonResponse({
 				success: true,
 				node: adminNode,
+				warnings: resourceWarning ? [resourceWarning] : [],
 				revisions: await kernel.getAdminRevisionsForRead({
 					env,
 					kv,
@@ -9047,6 +8907,8 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 						nextName: name
 					});
 					if (!mutation) continue;
+					const resourceViolation = getNodeResourceLimitViolation(name, mutation.nextNode);
+					if (resourceViolation) return jsonError("NODE_RESOURCE_LIMIT_EXCEEDED", "节点配置超过 Worker 资源限制", 400, resourceViolation);
 					mutation.dnsPlan = kernel.buildHostPrefixDnsSyncPlan(mutation.previousName, mutation.previousNode, mutation.nextName, mutation.nextNode, configuredHost, {
 						config: runtimeConfig,
 						forceUpsert: true
@@ -9056,6 +8918,7 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 					savedNodeNames.push(name);
 				}
 				if (action === "save" && savedNodeNames.length === 0) return jsonError("INVALID_TARGET", "目标源站必须是有效的 http/https URL");
+				assertPreparedHostPrefixDnsSyncReady(preparedMutations, runtimeConfig, env);
 				const shouldRebuildIndexes = savedNodeNames.length > 0 || renameMap.size > 0;
 				let nodeMutationCommitted = false;
 				let configRollbackState = null;
@@ -9144,7 +9007,7 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 		async saveMainVideoStreamPolicyShortcuts(data, { env, ctx, kv }) {
 			if (!kv) return jsonError("KV_UNAVAILABLE", "KV 未绑定或不可用", 500);
 			return await runKvDataMutation(kv)(async () => {
-				const currentNodes = await kernel.loadAllNodeEntitiesFromKv(kv, { ctx });
+				const currentNodes = await kernel.loadAllNodeEntitiesFromKvStrict(kv, { ctx });
 				const allowedNames = Array.isArray(currentNodes) ? currentNodes.map((node) => node?.name) : [];
 				const selectedNodeNames = reconcileNamedNodeSelection(data?.selectedNodeNames || [], { allowedNames });
 				const selectedKeys = new Set(selectedNodeNames.map((name) => String(name || "").trim().toLowerCase()).filter(Boolean));
@@ -9181,6 +9044,7 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 						updatedNodeCount += 1;
 					}
 				}
+				assertPreparedHostPrefixDnsSyncReady(preparedMutations, currentConfig, env);
 				const shouldSyncConfig = serializeConfigValue(currentConfig.sourceDirectNodes || []) !== serializeConfigValue(selectedNodeNames);
 				const configRollbackState = updatedNodeCount > 0 || shouldSyncConfig ? await kernel.captureRuntimeConfigRollbackState(env, kv) : null;
 				let rebuiltState = null;
@@ -9201,14 +9065,7 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 					}, {
 						env,
 						kv,
-						ctx,
-						snapshotMeta: {
-							reason: "sync_main_video_stream_shortcuts",
-							section: "proxy",
-							source: "ui_shortcut",
-							actor: "admin",
-							note: selectedNodeNames.join(",")
-						}
+						ctx
 					});
 				} catch (error) {
 					let configRollbackError = "";
@@ -9310,6 +9167,7 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 					});
 					preparedMutations.push(mutation);
 				}
+				assertPreparedHostPrefixDnsSyncReady(preparedMutations, nodeDnsConfig, env);
 				let savedConfig = null;
 				let nodeMutationCommitted = false;
 				try {
@@ -9321,13 +9179,7 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 					if (importedConfig) savedConfig = await kernel.commitRuntimeConfig(importedConfig, {
 						env,
 						kv,
-						ctx,
-						snapshotMeta: {
-							reason: "import_full",
-							section: "all",
-							source: "full_backup",
-							actor: "admin"
-						}
+						ctx
 					});
 					if (preparedMutations.length > 0) {
 						await kernel.applyPreparedNodeMutations(preparedMutations, {
@@ -10510,7 +10362,7 @@ async function probeDnsIpRoutingViaCloudflare(db, ip = "", entryColo = "UNKNOWN"
 			probedAt: finalizedAt,
 			expiresAt: nowMs() + Config.Defaults.DnsIpProbeCacheTtlSec * 1e3
 		};
-		if (db) await probeRepository.upsertDnsIpProbeCacheEntry(db, entry);
+		if (db && options.skipCacheWrite !== true) await probeRepository.upsertDnsIpProbeCacheEntry(db, entry);
 		return entry;
 	} catch (error) {
 		const entry = {
@@ -10526,7 +10378,7 @@ async function probeDnsIpRoutingViaCloudflare(db, ip = "", entryColo = "UNKNOWN"
 			probedAt: finalizedAt,
 			expiresAt: nowMs() + Config.Defaults.DnsIpProbeCacheTtlSec * 1e3
 		};
-		if (db) await probeRepository.upsertDnsIpProbeCacheEntry(db, entry);
+		if (db && options.skipCacheWrite !== true) await probeRepository.upsertDnsIpProbeCacheEntry(db, entry);
 		return entry;
 	} finally {
 		clearTimeout(timeoutId);
@@ -10591,15 +10443,26 @@ async function buildDnsIpWorkspaceItems(rawItems = [], db, entryColo = "UNKNOWN"
 	let probeDataSource = "cache";
 	if (syncTargets.length > 0) probeDataSource = "live_sync";
 	if (deferredTargets.length > 0) probeDataSource = "live_deferred";
-	await runWithConcurrency(syncTargets, probeConcurrency, async (targetIp) => {
-		const result = await probeDnsIpRoutingViaCloudflare(db, targetIp, entryColo, options);
+	const syncProbeResults = await runWithConcurrency(syncTargets, probeConcurrency, async (targetIp) => {
+		const result = await probeDnsIpRoutingViaCloudflare(db, targetIp, entryColo, {
+			...options,
+			skipCacheRead: true,
+			skipCacheWrite: true
+		});
 		probeMap.set(String(targetIp || "").toLowerCase(), result);
+		return result;
 	});
+	if (db && syncProbeResults.length) await options.probeRepository.upsertDnsIpProbeCacheEntries(db, syncProbeResults);
 	if (deferredTargets.length) {
 		deferredTargets.forEach((targetIp) => deferredTargetKeys.add(String(targetIp || "").toLowerCase()));
-		options.ctx.waitUntil(runWithConcurrency(deferredTargets, probeConcurrency, async (targetIp) => {
-			await probeDnsIpRoutingViaCloudflare(db, targetIp, entryColo, options);
-		}).catch((error) => {
+		options.ctx.waitUntil((async () => {
+			const results = await runWithConcurrency(deferredTargets, probeConcurrency, (targetIp) => probeDnsIpRoutingViaCloudflare(db, targetIp, entryColo, {
+				...options,
+				skipCacheRead: true,
+				skipCacheWrite: true
+			}));
+			if (db && results.length) await options.probeRepository.upsertDnsIpProbeCacheEntries(db, results);
+		})().catch((error) => {
 			console.warn("[DNS IP Workspace] Deferred probe failed:", error?.message || error);
 		}));
 	}
@@ -11283,12 +11146,13 @@ function defineNotificationActions(dependencies = {}, actions = {}) {
 		async pingNode(data, { env, ctx }) {
 			const currentConfig = await getRuntimeConfig(env);
 			const timeoutMs = clampIntegerConfig(data.timeout, currentConfig.pingTimeout ?? DEFAULT_PING_TIMEOUT_MS, 1e3, 18e4);
-			const requestedProbePath = String(data.probePath || "").trim();
 			if (data.target) {
 				const normalizedTarget = kernel.normalizeSingleTarget(data.target);
 				if (!normalizedTarget) return jsonError("INVALID_TARGET", "目标源站必须是有效的 http/https URL");
+				const probe = await kernel.pingTarget(normalizedTarget, timeoutMs);
 				return jsonResponse({
-					ms: await kernel.pingTarget(normalizedTarget, timeoutMs, { probePath: requestedProbePath }),
+					...(probe.ok ? { ms: probe.elapsedMs } : {}),
+					probe,
 					target: normalizedTarget,
 					usedCache: false,
 					scope: "target"
@@ -11301,12 +11165,13 @@ function defineNotificationActions(dependencies = {}, actions = {}) {
 			const linesToProbe = requestedLineId ? node.lines.filter((line) => line.id === requestedLineId) : node.lines.slice();
 			if (requestedLineId && !linesToProbe.length) return jsonError("LINE_NOT_FOUND", "线路不存在", 404);
 			const probedLines = await Promise.all(linesToProbe.map(async (line) => {
-				const ms = await kernel.pingTarget(line.target, timeoutMs, { probePath: requestedProbePath });
+				const probe = await kernel.pingTarget(line.target, timeoutMs);
 				return {
 					id: String(line?.id || "").trim(),
 					name: String(line?.name || "").trim(),
 					target: String(line?.target || "").trim(),
-					latencyMs: ms,
+					latencyMs: probe.ok ? probe.elapsedMs : null,
+					probe,
 					latencyUpdatedAt: (/* @__PURE__ */ new Date()).toISOString()
 				};
 			}));
@@ -11317,6 +11182,7 @@ function defineNotificationActions(dependencies = {}, actions = {}) {
 					name: updated.name,
 					target: updated.target,
 					latencyMs: updated.latencyMs,
+					probe: updated.probe,
 					latencyUpdatedAt: updated.latencyUpdatedAt
 				} : {
 					id: String(line?.id || "").trim(),
@@ -11333,7 +11199,8 @@ function defineNotificationActions(dependencies = {}, actions = {}) {
 			const matchedLine = requestedLineId ? responseLines.find((line) => line.id === requestedLineId) : activeLine;
 			const summaryNode = kernel.buildNodeSummary(nodeName.toLowerCase(), node).summary || { name: nodeName.toLowerCase() };
 			return jsonResponse({
-				ms: Number(matchedLine?.latencyMs ?? activeLine?.latencyMs ?? 9999),
+				...(matchedLine?.probe?.ok ? { ms: matchedLine.probe.elapsedMs } : {}),
+				probe: matchedLine?.probe || null,
 				usedCache: false,
 				sorted: false,
 				activeLineId,
@@ -11431,35 +11298,65 @@ function defineDatabaseActions(dependencies = {}, actions = {}) {
 				revisions: { logsRevision: kernel.getLogsRevisionFromStatus(logStatus?.log || logStatus) }
 			});
 		},
-		async getD1SchemaStatus(data, { db }) {
+		async getD1SchemaStatus(data, { db, env }) {
 			if (!db) return jsonError("D1_NOT_CONFIGURED", "请先绑定 D1 / PROXY_LOGS 数据库", 503);
+			const plan = await kernel.buildD1SchemaRepairPlan(db);
+			let tokenState = { token: "", expiresAt: 0 };
+			if (plan.phase === "destructive" && plan.blockingIssues.length === 0) tokenState = await kernel.createD1SchemaRepairToken(env, plan);
 			return jsonResponse({
 				success: true,
-				status: await kernel.getD1SchemaStatus(db)
+				status: {
+					...plan.status,
+					repairableIssues: plan.repairableIssues,
+					highRiskIssues: plan.highRiskIssues,
+					blockingIssues: plan.blockingIssues
+				},
+				repairPlan: {
+					version: plan.version,
+					phase: plan.phase,
+					contractVersion: plan.contractVersion,
+					contractHash: plan.contractHash,
+					schemaCookie: plan.schemaCookie,
+					planHash: plan.planHash,
+					risk: plan.risk,
+					repairableIssues: plan.repairableIssues,
+					highRiskIssues: plan.highRiskIssues,
+					blockingIssues: plan.blockingIssues,
+					steps: plan.steps,
+					repairToken: tokenState.token,
+					expiresAt: tokenState.expiresAt ? new Date(tokenState.expiresAt * 1e3).toISOString() : ""
+				}
 			});
 		},
-		async initLogsDb(data, { db }) {
+		async initLogsDb(data, { db, env, request }) {
 			if (!db) return jsonError("D1_NOT_CONFIGURED", "D1 database is not configured", 503);
-			const initialization = await kernel.initializeD1Database(db, { includeFts: true });
+			const initialization = await kernel.initializeD1Database(db, {
+				includeFts: true,
+				env,
+				repairMode: String(data?.repairMode || "safe").trim() || "safe",
+				repairToken: String(data?.repairToken || "").trim(),
+				confirmHighRisk: String(request?.headers?.get("X-Admin-Confirm") || "").trim() === "repairD1Schema"
+			});
 			const status = initialization.status;
 			const ftsReady = status.ftsReady === true;
 			const statsReady = status.tables?.[kernel.STATS_HOURLY_TABLE] === true;
-			const logStatus = await kernel.bumpLogsRevision(db, {
-				schemaReady: status.schemaReady === true,
+			const logStatus = status.schemaReady === true ? await kernel.bumpLogsRevision(db, {
+				schemaReady: true,
 				ftsReady,
 				statsReady,
 				categoryEnabled: true
-			});
+			}) : null;
 			return jsonResponse({
-				success: status.schemaReady === true,
+				success: initialization.completed === true || initialization.pendingHighRisk === true,
 				schemaReady: status.schemaReady === true,
+				pendingHighRisk: initialization.pendingHighRisk === true,
 				categoryEnabled: true,
 				ftsReady,
 				statsReady,
 				initialization,
 				steps: initialization.steps,
 				status,
-				revisions: { logsRevision: kernel.getLogsRevisionFromStatus(logStatus?.log || logStatus) }
+				revisions: logStatus ? { logsRevision: kernel.getLogsRevisionFromStatus(logStatus?.log || logStatus) } : {}
 			});
 		}
 	};
@@ -11612,6 +11509,61 @@ function invalidateNodeCacheTokens(nodeNames = [], state = nodeBindingCacheState
 function resetNodeCacheTokens(state = nodeBindingCacheStates.current()) {
 	state.NodeCacheResetGeneration += 1;
 	state.NodeCacheGenerations.clear();
+}
+function getUtf8ByteLength(value) {
+	return new TextEncoder().encode(String(value ?? "")).byteLength;
+}
+function createD1SerializedValueTooLargeError(field, value, options = {}) {
+	const actualBytes = getUtf8ByteLength(value);
+	const limitBytes = Math.max(1, Number(options.limitBytes) || D1_SAFE_SERIALIZED_VALUE_MAX_BYTES);
+	const error = /* @__PURE__ */ new Error(`D1 value exceeds the ${limitBytes}-byte compatibility budget`);
+	error.code = "D1_VALUE_TOO_LARGE";
+	error.status = 400;
+	error.details = { field: String(field || "value"), actualBytes, limitBytes, platformLimitBytes: D1_TEXT_VALUE_MAX_BYTES };
+	return error;
+}
+function assertD1SerializedValueFits(field, value, options = {}) {
+	if (getUtf8ByteLength(value) > Math.max(1, Number(options.limitBytes) || D1_SAFE_SERIALIZED_VALUE_MAX_BYTES)) throw createD1SerializedValueTooLargeError(field, value, options);
+	return value;
+}
+function getNodeResourceLimitViolation(nodeName, nodeData = {}) {
+	const name = String(nodeName || "").trim().toLowerCase();
+	const node = isPlainObject(nodeData) ? nodeData : {};
+	const lines = Array.isArray(node.lines) ? node.lines : [];
+	if (lines.length > NODE_LINE_MAX) return { nodeName: name, field: "lines", actual: lines.length, limit: NODE_LINE_MAX };
+	const headers = isPlainObject(node.headers) ? node.headers : {};
+	const headerEntries = Object.entries(headers);
+	if (headerEntries.length > NODE_HEADER_MAX) return { nodeName: name, field: "headers.count", actual: headerEntries.length, limit: NODE_HEADER_MAX };
+	let headerBytes = 0;
+	for (const [headerName, value] of headerEntries) {
+		const keyBytes = getUtf8ByteLength(headerName);
+		const valueBytes = getUtf8ByteLength(value);
+		if (keyBytes > NODE_HEADER_KEY_MAX_BYTES) return { nodeName: name, field: `headers.${headerName}.keyBytes`, actual: keyBytes, limit: NODE_HEADER_KEY_MAX_BYTES };
+		if (valueBytes > NODE_HEADER_VALUE_MAX_BYTES) return { nodeName: name, field: `headers.${headerName}.valueBytes`, actual: valueBytes, limit: NODE_HEADER_VALUE_MAX_BYTES };
+		headerBytes += keyBytes + valueBytes;
+	}
+	if (headerBytes > NODE_HEADER_TOTAL_MAX_BYTES) return { nodeName: name, field: "headers.bytes", actual: headerBytes, limit: NODE_HEADER_TOTAL_MAX_BYTES };
+	for (const field of NODE_BOUNDED_TEXT_FIELDS) {
+		const bytes = getUtf8ByteLength(node[field]);
+		if (bytes > NODE_TEXT_FIELD_MAX_BYTES) return { nodeName: name, field, actual: bytes, limit: NODE_TEXT_FIELD_MAX_BYTES };
+	}
+	for (let index = 0; index < (Array.isArray(node.tags) ? node.tags.length : 0); index += 1) {
+		const bytes = getUtf8ByteLength(node.tags[index]);
+		if (bytes > NODE_TEXT_FIELD_MAX_BYTES) return { nodeName: name, field: `tags.${index}`, actual: bytes, limit: NODE_TEXT_FIELD_MAX_BYTES };
+	}
+	for (let index = 0; index < lines.length; index += 1) for (const field of ["id", "name", "target"]) {
+		const bytes = getUtf8ByteLength(lines[index]?.[field]);
+		if (bytes > NODE_TEXT_FIELD_MAX_BYTES) return { nodeName: name, field: `lines.${index}.${field}`, actual: bytes, limit: NODE_TEXT_FIELD_MAX_BYTES };
+	}
+	let serializedBytes = 0;
+	try { serializedBytes = getUtf8ByteLength(JSON.stringify(node)); }
+	catch { return { nodeName: name, field: "record", actual: null, limit: NODE_RECORD_MAX_BYTES }; }
+	if (serializedBytes > NODE_RECORD_MAX_BYTES) return { nodeName: name, field: "record.bytes", actual: serializedBytes, limit: NODE_RECORD_MAX_BYTES };
+	return null;
+}
+function buildNodeResourceWarning(nodeName, nodeData = {}) {
+	const violation = getNodeResourceLimitViolation(nodeName, nodeData);
+	return violation ? { code: "NODE_RESOURCE_LIMIT_EXCEEDED", ...violation } : null;
 }
 async function runNodeIndexMutation(mutation, kv = null) {
 	const state = getNodeBindingCacheState(kv);
@@ -11872,8 +11824,11 @@ function withDashboardSnapshotCacheStatus(snapshot = {}, cacheStatus = "live", o
 //#region worker/features/proxy/playback/state.js
 function releasePlaybackProgressRelayEntry(entry) {
 	if (!entry || typeof entry !== "object") return;
+	try { entry.cancelScheduledDelay?.(); } catch {}
+	entry.cancelScheduledDelay = null;
 	entry.pendingSnapshot = null;
 	entry.scheduledFlushAt = 0;
+	entry.scheduledPromise = null;
 	entry.waitUntilCtx = null;
 }
 function deletePlaybackProgressRelayEntry(sessionKey) {
@@ -11885,9 +11840,20 @@ function deletePlaybackProgressRelayEntry(sessionKey) {
 }
 function setBoundedPlaybackProgressRelayEntry(sessionKey, entry) {
 	const relayMap = cacheState.PlaybackProgressRelay;
-	if (!(relayMap instanceof Map)) return entry;
-	setBoundedMapEntry(relayMap, sessionKey, entry, Math.max(1, Number(Config.Defaults.VideoProgressForwardSessionMax) || 1));
-	return entry;
+	if (!(relayMap instanceof Map)) return false;
+	const maxSize = Math.max(1, Number(Config.Defaults.VideoProgressForwardSessionMax) || 1);
+	if (!relayMap.has(sessionKey) && relayMap.size >= maxSize) {
+		let evictKey = "";
+		for (const [candidateKey, candidate] of relayMap) if (!candidate?.activeFlushPromise) {
+			evictKey = candidateKey;
+			break;
+		}
+		if (!evictKey) return false;
+		deletePlaybackProgressRelayEntry(evictKey);
+	}
+	if (relayMap.has(sessionKey)) relayMap.delete(sessionKey);
+	relayMap.set(sessionKey, entry);
+	return true;
 }
 //#endregion
 //#region worker/features/proxy/routing/url-model.js
@@ -12950,46 +12916,18 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 				nextTidyConfig = normalizedTidyConfig;
 				migratedConfigKeys.push("sourceDirectNodes");
 			}
-			const rawSnapshots = await kernel.readStoredConfigSnapshotsStrict(kv);
-			const [configMeta, snapshotsMeta] = await Promise.all([kernel.readRevisionMetaForRead(kv, kernel.CONFIG_META_KEY), kernel.readRevisionMetaForRead(kv, kernel.CONFIG_SNAPSHOTS_META_KEY, { count: 0 })]);
+			const configMeta = await kernel.readRevisionMetaForRead(kv, kernel.CONFIG_META_KEY);
 			const revisions = {
 				configRevision: String(configMeta?.revision || ""),
-				configContentHash: hashStableText(serializeConfigValue(currentStoredConfig)),
-				snapshotsRevision: String(snapshotsMeta?.revision || ""),
-				snapshotsContentHash: hashStableText(serializeConfigValue(rawSnapshots))
+				configContentHash: hashStableText(serializeConfigValue(currentStoredConfig))
 			};
-			const { rewrittenSnapshots, rewrittenSnapshotCount, deletedLegacySnapshotFieldCount, migratedConfigKeys: snapshotMigratedConfigKeys } = kernel.rewriteKvTidySnapshots(rawSnapshots);
-			migratedConfigKeys.push(...snapshotMigratedConfigKeys);
+			const hasLegacyConfigSnapshotData = allKeys.includes(kernel.CONFIG_SNAPSHOTS_KEY);
 			const configRewriteNeeded = repairedConfig.hadMalformedValue || serializeConfigValue(currentStoredConfig) !== serializeConfigValue(nextTidyConfig);
-			const tidySnapshotNoteParts = kernel.buildKvTidyNoteParts({
-				legacyKeysPresent: configMigration.legacyKeysPresent,
-				rewrittenSnapshotCount,
-				rewrittenNodeCount,
-				migratedTopLevelPortNodeCount,
-				migratedLinePortCount,
-				migratedDefaultPortNodeCount,
-				migratedDefaultPortLineCount
-			}, {
-				includeRepairSource: true,
-				repairLabel: "repair_source",
-				repairedConfig
-			});
 			const configDiffEntries = getConfigDiffEntries(repairedConfig.config, nextTidyConfig);
-			const nextSnapshots = [];
-			if (configDiffEntries.length > 0) nextSnapshots.push(kernel.createSyntheticConfigSnapshot(repairedConfig.config, {
-				reason: "tidy_kv_data",
-				section: "all",
-				source: "kv_tidy",
-				actor: "admin",
-				note: tidySnapshotNoteParts.join("; ") || (repairedConfig.hadMalformedValue ? "repair_malformed_sys_config" : "sanitize_runtime_config")
-			}, {
-				changedKeys: configDiffEntries.map((item) => item.key),
-				changeCount: configDiffEntries.length
-			}));
-			if (rewrittenSnapshots.length > 0) nextSnapshots.push(...rewrittenSnapshots);
-			const retainedSnapshots = nextSnapshots.length > 0 ? nextSnapshots : rawSnapshots;
-			const unreferencedAdminIndexUploadKeys = kernel.collectUnreferencedAdminIndexUploadKeys(nextTidyConfig, retainedSnapshots, adminIndexUploadKeys);
+			const unreferencedAdminIndexUploadKeys = kernel.collectUnreferencedAdminIndexUploadKeys(nextTidyConfig, [], adminIndexUploadKeys);
 			for (const key of unreferencedAdminIndexUploadKeys) removableKeys.add(key);
+			if (allKeys.includes(kernel.CONFIG_SNAPSHOTS_KEY)) removableKeys.add(kernel.CONFIG_SNAPSHOTS_KEY);
+			if (allKeys.includes(kernel.CONFIG_SNAPSHOTS_META_KEY)) removableKeys.add(kernel.CONFIG_SNAPSHOTS_META_KEY);
 			const rebuiltNodeSummaries = kernel.normalizeNodeSummaryIndex(fullEntityNodes).nodes;
 			const rebuiltNodeIndex = kernel.normalizeNodeIndex(rebuiltNodeSummaries.map((node) => node?.name));
 			const nextIndexText = JSON.stringify(rebuiltNodeIndex);
@@ -13000,11 +12938,6 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 			const removableKeyList = [...removableKeys].sort();
 			const plannedDeleteKeyList = [.../* @__PURE__ */ new Set([...cacheInvalidationKeys, ...removableKeyList])].filter(Boolean).sort();
 			const mutationPlan = [];
-			if (nextSnapshots.length > 0) mutationPlan.push({
-				type: "put",
-				key: kernel.CONFIG_SNAPSHOTS_KEY,
-				value: JSON.stringify(nextSnapshots)
-			});
 			if (configRewriteNeeded) mutationPlan.push({
 				type: "put",
 				key: kernel.CONFIG_KEY,
@@ -13043,11 +12976,9 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 				configReadSource: repairedConfig.source,
 				configRewritten: configRewriteNeeded,
 				migratedConfigKeys: normalizeDistinctConfigKeyList(migratedConfigKeys),
-				rewrittenSnapshotCount,
-				deletedLegacyFieldCount: configMigration.deletedLegacyFieldCount + deletedLegacySnapshotFieldCount + deletedLegacyNodeFieldCount,
+				deletedLegacyFieldCount: configMigration.deletedLegacyFieldCount + deletedLegacyNodeFieldCount,
 				deletedLegacyConfigFieldCount: configMigration.deletedLegacyFieldCount,
 				deletedLegacyNodeFieldCount,
-				deletedLegacySnapshotFieldCount,
 				migratedTopLevelPortNodeCount,
 				migratedLinePortCount,
 				migratedDefaultPortNodeCount,
@@ -13062,14 +12993,12 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 				deletedDnsFetchLockKeyCount: dnsFetchLockKeyCount,
 				deletedAdminIndexUploadCount: unreferencedAdminIndexUploadKeys.length,
 				untouchedOtherKeyCount,
-				rawSnapshotCount: rawSnapshots.length,
 				previousFullIndexBytes,
 				nextSummaryIndexBytes,
 				savedBytes
 			};
 			const fieldGroups = buildKvTidyFieldGroups({
 				configFieldTargets: summary.migratedConfigKeys,
-				rewrittenSnapshotCount,
 				sourceDirectNodesFromLegacyNodes,
 				migratedTopLevelPortNodeCount,
 				migratedLinePortCount,
@@ -13085,7 +13014,6 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 			const scheduledLockKeys = removableKeyList.filter((key) => key === kernel.LEGACY_SCHEDULED_LOCK_KEY);
 			const dnsFetchLockKeys = removableKeyList.filter((key) => key.startsWith(LEGACY_DNS_IP_POOL_FETCH_LOCK_KV_KEY_PREFIX));
 			const staleAdminIndexUploadKeys = removableKeyList.filter((key) => key.startsWith(kernel.ADMIN_INDEX_UPLOAD_PREFIX));
-			const rewrittenSnapshotIds = rewrittenSnapshots.map((snapshot) => snapshot?.id);
 			const rewrittenNodeNames = rewrittenNodes.map((node) => node.name);
 			pushTidyPreviewGroup(deleteGroups, staleCfCacheKeys.length > 0, "cf_dash_cache", "Cloudflare 仪表盘缓存", staleCfCacheKeys, staleCfCacheKeys.length, "会删除遗留的 sys:cf_dash_cache 及其按日期 / Zone 生成的缓存键。");
 			pushTidyPreviewGroup(deleteGroups, loginFailureKeys.length > 0, "login_failures", "旧版登录失败计数", loginFailureKeys, loginFailureKeys.length, "会删除旧版 fail:* 登录失败计数键，后续仅保留 D1 auth_failures。");
@@ -13094,7 +13022,8 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 			pushTidyPreviewGroup(deleteGroups, telegramAlertStateKeys.length > 0, "telegram_alert_state", "旧版 Telegram 告警冷却状态", telegramAlertStateKeys, telegramAlertStateKeys.length, "会删除 sys:telegram_alert_state:v1，后续只保留 D1 sys_status scope。");
 			pushTidyPreviewGroup(deleteGroups, scheduledLockKeys.length > 0, "scheduled_lock", "旧版定时租约键", scheduledLockKeys, scheduledLockKeys.length, "会删除 sys:scheduled_lock:v1，后续只保留 D1 sys_locks。");
 			pushTidyPreviewGroup(deleteGroups, dnsFetchLockKeys.length > 0, "dns_fetch_lock", "旧版 DNS 抓取锁键", dnsFetchLockKeys, dnsFetchLockKeys.length, "会删除 sys:dns_ip_pool_fetch_lock:v1:*，后续只保留 D1 sys_locks。");
-			pushTidyPreviewGroup(deleteGroups, staleAdminIndexUploadKeys.length > 0, "admin_index_uploads", "未引用的本地 HTML 版本", staleAdminIndexUploadKeys, staleAdminIndexUploadKeys.length, "只删除当前配置和保留快照都不再引用的内容寻址 index.html。");
+			pushTidyPreviewGroup(deleteGroups, hasLegacyConfigSnapshotData || snapshotMetaKeyCount > 0, "legacy_config_snapshot_keys", "停用的设置历史键", [kernel.CONFIG_SNAPSHOTS_KEY, kernel.CONFIG_SNAPSHOTS_META_KEY], Number(hasLegacyConfigSnapshotData) + Number(snapshotMetaKeyCount > 0), "会删除已停用的设置历史键及其元数据。");
+			pushTidyPreviewGroup(deleteGroups, staleAdminIndexUploadKeys.length > 0, "admin_index_uploads", "未引用的本地 HTML 版本", staleAdminIndexUploadKeys, staleAdminIndexUploadKeys.length, "只保留当前配置引用的内容寻址 index.html。");
 			const rewriteGroups = [];
 			if (configRewriteNeeded) pushTidyPreviewGroup(rewriteGroups, true, "runtime_config", "全局设置 sys:theme", [...configMigration.legacyKeysPresent, ...configDiffEntries.map((item) => item.key)], 1, "会把旧版设置字段吸收到当前 schema，并以后端 sanitizeRuntimeConfig() 结果回写。");
 			if (rewrittenNodeCount > 0) {
@@ -13111,10 +13040,9 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 				note: "不会整批删除 node:*，只会按需重写必要节点。"
 			})];
 			if (dnsRecordHistoryKeyCount > 0) pushTidyPreviewGroup(preserveGroups, true, "dns_record_history", "DNS 历史记录", allKeys.filter((key) => key.startsWith(kernel.DNS_RECORD_HISTORY_PREFIX)), dnsRecordHistoryKeyCount, "不会删除 sys:dns_record_history:v1:*。");
-			const preservedMetaCount = configMetaKeyCount + snapshotMetaKeyCount + nodeIndexMetaKeyCount;
-			if (preservedMetaCount > 0) pushTidyPreviewGroup(preserveGroups, true, "meta_keys", "配置 / 快照 / 索引元信息", [
+			const preservedMetaCount = configMetaKeyCount + nodeIndexMetaKeyCount;
+			if (preservedMetaCount > 0) pushTidyPreviewGroup(preserveGroups, true, "meta_keys", "配置 / 索引元信息", [
 				kernel.CONFIG_META_KEY,
-				kernel.CONFIG_SNAPSHOTS_META_KEY,
 				kernel.NODES_INDEX_META_KEY
 			], preservedMetaCount, "不会删除这些 revision / meta 键。");
 			const warnings = [];
@@ -13124,7 +13052,7 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 			if (migratedDefaultPortNodeCount > 0 || migratedDefaultPortLineCount > 0) warnings.push(`检测到 ${migratedDefaultPortNodeCount} 个节点 / ${migratedDefaultPortLineCount} 条线路仍未显式写端口；整理后会按协议补齐为 :443 / :80。`);
 			if (storedSummaryIndexState?.legacyMirrorDetected === true) warnings.push(`检测到旧版 sys:nodes_index_full:v2 仍保存完整节点镜像；本次会按 node:* 重建并收敛为摘要索引（${previousFullIndexBytes} -> ${nextSummaryIndexBytes} bytes）。`);
 			if (untouchedOtherKeyCount > 0) warnings.push(`发现 ${untouchedOtherKeyCount} 个未列入整理白名单的 KV 键，本次不会自动删除。`);
-			if (deleteGroups.length === 0 && !configRewriteNeeded && rewrittenSnapshotCount === 0 && rewrittenNodeCount === 0) warnings.push("当前没有检测到需要执行的 KV 清理动作；本次更多是一轮一致性巡检。");
+			if (deleteGroups.length === 0 && !configRewriteNeeded && rewrittenNodeCount === 0) warnings.push("当前没有检测到需要执行的 KV 清理动作；本次更多是一轮一致性巡检。");
 			warnings.push(buildKvTidyQuotaBudgetWarning(quotaBudget));
 			if (quotaBudget.blocked === true && quotaBudget.reason) warnings.push(quotaBudget.reason);
 			const plan = {
@@ -13317,10 +13245,30 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 			const db = options.db || kernel.getDB(env);
 			const kv = options.kv || kernel.getKV(env) || null;
 			if (!db) throw new Error("D1 not configured");
-			const schemaStatus = await kernel.getD1SchemaStatus(db);
+			const schemaStatus = options.schemaStatus?.schemaReady === true ? options.schemaStatus : await kernel.getD1SchemaReadiness(db, { allowAttestedFastPath: true, env });
+			if (schemaStatus.schemaReady !== true) {
+				const preview = kernel.createEmptyTidyPreview("d1");
+				preview.warnings.push("D1 结构尚未通过运行时兼容检查；本预览不授权删除，必须先完成统一“初始化 DB”并重新预览。");
+				return {
+					scope: "d1",
+					mode: "manual",
+					maintenanceMode: normalizeTidyMaintenanceMode(options.maintenanceMode, "manual"),
+					schemaStatus,
+					flags: {},
+					summary: {
+						status: "blocked",
+						schemaReady: false,
+						requiresSchemaInitialization: true,
+						issues: schemaStatus.issues
+					},
+					preview,
+					planHash: ""
+				};
+			}
 			const runtimeConfig = sanitizeRuntimeConfig(options.config || (env ? await getRuntimeConfig(env) : {}));
 			const baseContext = D1TidyPlanner.buildContext(runtimeConfig, options);
 			const context = D1TidyPlanner.attachPreviousState(kernel, baseContext, options.previousCleanupStatus);
+			context.schemaStatus = schemaStatus;
 			context.logQueuePendingCount = logBindingStates.get(db).LogQueue.length;
 			const facts = await D1TidyPlanner.readFacts(kernel, db, kv, context);
 			const sourcePolicy = D1TidyPlanner.buildSourcePolicy(facts.d1DnsIpPoolSources);
@@ -13346,6 +13294,7 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 				statsStartTs: context.statsStartTs,
 				statsEndTs: context.statsEndTs,
 				statsUtcOffsetMinutes: context.statsUtcOffsetMinutes,
+				statsRetentionBoundaryDate: facts.statsRetentionBoundaryDate,
 				d1DnsIpPoolSources: facts.d1DnsIpPoolSources,
 				kvDnsIpPoolSources: facts.kvDnsIpPoolSources,
 				dnsIpPoolSourceAction: sourcePolicy.dnsIpPoolSourceAction,
@@ -13364,7 +13313,7 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 			const db = options.db || kernel.getDB(env);
 			const kv = options.kv || kernel.getKV(env) || null;
 			if (!db) throw new Error("D1 not configured");
-			const compatibilityStatus = await kernel.getD1SchemaStatus(db);
+			const compatibilityStatus = options.schemaStatus?.schemaReady === true ? options.schemaStatus : plan?.schemaStatus?.schemaReady === true ? plan.schemaStatus : await kernel.getD1SchemaReadiness(db, { allowAttestedFastPath: true, env });
 			if (compatibilityStatus.schemaReady !== true) {
 				const error = /* @__PURE__ */ new Error("D1 schema must pass runtime compatibility checks before tidy execution");
 				error.code = "D1_SCHEMA_INCOMPATIBLE";
@@ -13402,55 +13351,32 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 				if (!continueOnStepFailure) throw error;
 				return false;
 			};
-			await beforeStep("bootstrapD1Schema");
-			await kernel.bootstrapD1Schema(db, "logs-core");
 			const logState = logBindingStates.get(db);
 			if (logState.LogFlushTask) await Promise.resolve(logState.LogFlushTask).catch(() => {});
-			if (env && logState.LogQueue.length > 0) {
-				await beforeStep("flushLogQueue");
-				await Logger.flush(env).catch(() => {});
-			}
-			performedCleanupWork = await D1TidyExecutor.runDeleteSteps(D1TidyExecutor.buildDeleteSteps(kernel, executionPlan, summary, flags, db), beforeStep) || performedCleanupWork;
-			if (mode === "manual") {
-				if (flags.rebuildStatsHourly === true) {
-					await beforeStep("rebuildStatsHourlyWindow");
-					await kernel.rebuildStatsHourlyWindow(db, {
-						startTs: executionPlan.retentionCutoffMs,
-						endTs: executionPlan.nowMs,
-						utcOffsetMinutes: executionPlan.utcOffsetMinutes
-					});
-					summary.rebuiltStatsHourly = true;
-					summary.statsRebuildStatus = "success";
-					performedCleanupWork = true;
-				} else summary.statsRebuildStatus = "skipped";
-				summary.statsAlignStatus = "skipped";
+			const maintenanceStartedAt = nowMs();
+			const deleteScopes = D1TidyExecutor.buildDeleteScopes(kernel, executionPlan, flags, db);
+			const deleteResult = await D1TidyExecutor.runBudgetedDeleteScopes(deleteScopes, summary, beforeStep, { startedAt: maintenanceStartedAt });
+			summary.hasMore = deleteResult.hasMore;
+			summary.remainingScopes = deleteResult.remainingScopes;
+			summary.budget = deleteResult.budget;
+			performedCleanupWork = deleteResult.budget.processedRows > 0;
+			if (flags.rebuildStatsHourly === true && nowMs() - maintenanceStartedAt < D1_TIDY_TIME_LIMIT_MS) try {
+				await beforeStep("resetStatsHourly");
+				await kernel.clearStatsHourly(db);
+				summary.alignedStatsWindow = true;
+				summary.statsAlignStatus = "success";
+				summary.statsRebuildStatus = "reset_for_new_logs";
+				performedCleanupWork = true;
+			} catch (error) {
+				recordStepFailure("statsRebuildStatus", "statsRebuildError", error, "D1 stats reset Error");
 			} else {
-				if (flags.alignStatsWindow === true) try {
-					await beforeStep("alignStatsHourlyWindow");
-					const aligned = await kernel.ensureStatsHourlyWindowAligned(stores, {
-						config: executionPlan.config,
-						now: executionPlan.dayWindow?.now instanceof Date ? executionPlan.dayWindow.now : new Date(executionPlan.scheduledNowMs || executionPlan.nowMs)
-					});
-					summary.alignedStatsWindow = aligned?.rebuilt === true;
-					summary.statsAlignStatus = aligned?.rebuilt === true ? "success" : "skipped";
-				} catch (error) {
-					recordStepFailure("statsAlignStatus", "statsAlignError", error, "Scheduled stats alignment Error");
-				}
-				if (flags.rebuildDailyStats === true || flags.rebuildStatsHourly === true) try {
-					await beforeStep("rebuildDailyStatsHourly");
-					await kernel.rebuildStatsHourlyForDate(db, {
-						bucketDate: executionPlan.statsBucketDate,
-						startTs: executionPlan.statsStartTs,
-						endTs: executionPlan.statsEndTs,
-						utcOffsetMinutes: executionPlan.statsUtcOffsetMinutes
-					});
-					summary.rebuiltStatsHourly = true;
-					summary.statsRebuildStatus = "success";
-				} catch (error) {
-					recordStepFailure("statsRebuildStatus", "statsRebuildError", error, "Scheduled stats rebuild Error");
-				}
+				summary.statsAlignStatus = flags.rebuildStatsHourly === true ? "deferred_budget" : "skipped";
+				summary.statsRebuildStatus = flags.rebuildStatsHourly === true ? "deferred_budget" : "skipped";
 			}
-			if (flags.rebuildLogsFts === true) try {
+			const maintenanceHasTime = () => nowMs() - maintenanceStartedAt < D1_TIDY_TIME_LIMIT_MS;
+			if (flags.rebuildLogsFtsDeferred === true) summary.ftsRebuildStatus = flags.ftsRebuildDeferredReason || "deferred_size_guard";
+			else if (flags.rebuildLogsFts === true && (summary.hasMore || !maintenanceHasTime())) summary.ftsRebuildStatus = "deferred_budget";
+			else if (flags.rebuildLogsFts === true) try {
 				await beforeStep("rebuildLogsFts");
 				let rebuiltLogsFts = false;
 				if (await kernel.hasLogsFtsTable(db)) rebuiltLogsFts = await kernel.rebuildLogsFts(db);
@@ -13460,22 +13386,9 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 				summary.lastFtsRebuildAt = (/* @__PURE__ */ new Date()).toISOString();
 				performedCleanupWork = performedCleanupWork || rebuiltLogsFts === true;
 			} catch (error) {
-				if (mode === "scheduled") try {
-					await beforeStep("rebuildLogsFtsForceRecreate");
-					const ensuredFts = await kernel.ensureLogsFtsSchema(db, { forceRecreate: true });
-					summary.rebuiltLogsFts = ensuredFts.rebuilt === true;
-					summary.ftsRebuildStatus = ensuredFts.rebuilt === true ? "success" : "skipped";
-					summary.ftsRebuildRecovered = ensuredFts.recreated === true;
-					summary.ftsRebuildError = "";
-					summary.lastFtsRebuildAt = (/* @__PURE__ */ new Date()).toISOString();
-					performedCleanupWork = performedCleanupWork || ensuredFts.rebuilt === true;
-					console.warn("Scheduled FTS rebuild recovered by recreating schema.");
-				} catch (repairError) {
-					recordStepFailure("ftsRebuildStatus", "ftsRebuildError", repairError, "Scheduled FTS rebuild Error");
-				}
-				else recordStepFailure("ftsRebuildStatus", "ftsRebuildError", error, "D1 logs FTS rebuild Error");
+				recordStepFailure("ftsRebuildStatus", "ftsRebuildError", error, "D1 logs FTS rebuild Error");
 			}
-			if (flags.optimizeDb === true) try {
+			if (flags.optimizeDb === true && !summary.hasMore && maintenanceHasTime()) try {
 				await beforeStep("optimizeLogsDb");
 				await kernel.optimizeLogsDb(db);
 				summary.optimizedDb = true;
@@ -13484,17 +13397,24 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 				performedCleanupWork = true;
 			} catch (error) {
 				recordStepFailure("optimizeStatus", "optimizeError", error, mode === "scheduled" ? "Scheduled DB optimize Error" : "D1 optimize Error");
-			}
+			} else if (flags.optimizeDb === true) summary.optimizeStatus = "deferred_budget";
+			summary.budget.durationMs = Math.max(0, nowMs() - maintenanceStartedAt);
+			if (summary.budget.durationMs >= D1_TIDY_TIME_LIMIT_MS && !summary.budget.exhaustedBy) summary.budget.exhaustedBy = "time_limit";
 			await beforeStep("patchLogStatus");
 			const nowIso = await D1TidyExecutor.patchLogStatus(kernel, db, stores, executionPlan, summary, flags, options);
-			if (summary.status !== "partial_failure" && summary.status !== "failed") if (mode === "scheduled") {
-				const hasDeferredMaintenance = flags.rebuildLogsFtsDeferred === true || flags.optimizeDbDeferred === true;
-				if (performedCleanupWork) summary.status = "success";
-				else {
-					summary.status = "skipped";
-					summary.reason = hasDeferredMaintenance ? "maintenance_deferred" : "no_expired_data";
-				}
-			} else summary.status = "success";
+			if (summary.status !== "partial_failure" && summary.status !== "failed") {
+				if (summary.hasMore) {
+					summary.status = "success";
+					summary.reason = "maintenance_budget_exhausted";
+				} else if (mode === "scheduled") {
+					const hasDeferredMaintenance = flags.rebuildLogsFtsDeferred === true || flags.optimizeDbDeferred === true;
+					if (performedCleanupWork) summary.status = "success";
+					else {
+						summary.status = "skipped";
+						summary.reason = hasDeferredMaintenance ? "maintenance_deferred" : "no_expired_data";
+					}
+				} else summary.status = "success";
+			}
 			summary.finishedAt = nowIso;
 			return kernel.buildTidyResult(executionPlan, summary, "d1");
 		},
@@ -13505,7 +13425,7 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 			if (!db) throw new Error("D1 not configured");
 			if (mode === "manual") {
 				const tokenPayload = await kernel.verifyD1TidyPlanToken(env, options.planToken);
-				const statusBefore = await kernel.getD1SchemaStatus(db);
+				const statusBefore = await kernel.getD1SchemaReadiness(db, { allowAttestedFastPath: true, env });
 				if (statusBefore.schemaReady !== true) {
 					const error = /* @__PURE__ */ new Error("D1 schema changed after preview; initialize and preview again");
 					error.code = "TIDY_PLAN_STALE";
@@ -13526,7 +13446,8 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 					statsBucketDate: String(tokenPayload.statsBucketDate || ""),
 					statsStartTs: Number(tokenPayload.statsStartTs) || 0,
 					statsEndTs: Number(tokenPayload.statsEndTs) || 0,
-					statsUtcOffsetMinutes: Number(tokenPayload.statsUtcOffsetMinutes) || 0
+					statsUtcOffsetMinutes: Number(tokenPayload.statsUtcOffsetMinutes) || 0,
+					schemaStatus: statusBefore
 				});
 				if (String(plan.planHash || "") !== String(tokenPayload.planHash || "")) {
 					const error = /* @__PURE__ */ new Error("D1 tidy data changed after preview");
@@ -13545,12 +13466,13 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 						db,
 						env,
 						mode,
-						maintenanceMode: plan.maintenanceMode
+						maintenanceMode: plan.maintenanceMode,
+						schemaStatus: statusBefore
 					}),
 					schema: statusBefore
 				};
 			}
-			const statusBefore = await kernel.getD1SchemaStatus(db);
+			const statusBefore = await kernel.getD1SchemaReadiness(db, { allowAttestedFastPath: true, env });
 			if (statusBefore.schemaReady !== true) {
 				const error = /* @__PURE__ */ new Error("D1 schema is not initialized");
 				error.code = "D1_SCHEMA_NOT_READY";
@@ -13562,13 +13484,15 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 				...options,
 				db,
 				mode,
-				maintenanceMode
+				maintenanceMode,
+				schemaStatus: statusBefore
 			});
 			return {
 				...await kernel.applyD1TidyPlan(plan, {
 					...options,
 					db,
-					env
+					env,
+					schemaStatus: statusBefore
 				}),
 				schema: statusBefore
 			};
@@ -13599,87 +13523,15 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 function defineSnapshotMethods(dependencies = {}, kernel = {}) {
 	const { D1TidyExecutor, D1TidyPlanner, Logger, buildAdminReleaseVendorManifest, normalizeAdminReleaseVendorManifestRecord, validateAdminShellHtmlSource } = dependencies;
 	return {
-		normalizeConfigSnapshotMeta(meta = {}) {
-			/** @type {ConfigSnapshotMeta} */
-			const input = meta && typeof meta === "object" ? meta : {};
-			return {
-				reason: String(input.reason || "save_config").trim() || "save_config",
-				section: String(input.section || "all").trim() || "all",
-				actor: String(input.actor || "admin").trim() || "admin",
-				source: String(input.source || "ui").trim() || "ui",
-				note: String(input.note || "").trim()
-			};
-		},
-		async readStoredConfigSnapshots(kv) {
-			if (!kv) return [];
-			try {
-				const stored = await kv.get(kernel.CONFIG_SNAPSHOTS_KEY, { type: "json" });
-				return Array.isArray(stored) ? stored : [];
-			} catch {
-				return [];
-			}
-		},
-		async readStoredConfigSnapshotsStrict(kv) {
+		async readLegacyConfigSnapshotRecordsStrict(kv) {
 			if (!kv) return [];
 			const stored = await kvGetStrict(kv, kernel.CONFIG_SNAPSHOTS_KEY, { type: "json" });
 			if (stored === null || stored === void 0) return [];
 			if (Array.isArray(stored)) return stored;
-			const error = /* @__PURE__ */ new Error("Stored config snapshots are invalid");
+			const error = /* @__PURE__ */ new Error("Stored legacy config snapshot records are invalid");
 			error.code = "CONFIG_SNAPSHOTS_INVALID";
 			error.status = 409;
 			throw error;
-		},
-		async writeStoredConfigSnapshots(kv, snapshots = [], options = {}) {
-			if (!kv) return [];
-			const nextSnapshots = Array.isArray(snapshots) ? snapshots.slice(0, Config.Defaults.ConfigSnapshotLimit) : [];
-			await kv.put(kernel.CONFIG_SNAPSHOTS_KEY, JSON.stringify(nextSnapshots));
-			await kernel.ensureConfigSnapshotsMeta(kv, nextSnapshots, options);
-			return nextSnapshots;
-		},
-		createSyntheticConfigSnapshot(config, meta = {}, options = {}) {
-			const snapshotMeta = kernel.normalizeConfigSnapshotMeta(meta);
-			const changedKeys = normalizeDistinctConfigKeyList(options.changedKeys || []);
-			const extraFields = isPlainObject(options.extraFields) ? options.extraFields : {};
-			return redactConfigSnapshotSecrets({
-				id: `cfg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-				createdAt: (/* @__PURE__ */ new Date()).toISOString(),
-				reason: snapshotMeta.reason,
-				section: snapshotMeta.section,
-				actor: snapshotMeta.actor,
-				source: snapshotMeta.source,
-				note: snapshotMeta.note,
-				changedKeys,
-				changeCount: Number(options.changeCount) || changedKeys.length,
-				config: redactRuntimeConfigSecrets(config),
-				...extraFields
-			});
-		},
-		async getConfigSnapshots(kv, options = {}) {
-			if (!kv) return [];
-			const rawSnapshots = await kernel.readStoredConfigSnapshots(kv);
-			return kernel.normalizeConfigSnapshotsForResponse(rawSnapshots, options);
-		},
-		normalizeConfigSnapshotsForResponse(rawSnapshots = [], options = {}) {
-			const includeConfig = options.withConfig === true;
-			return (Array.isArray(rawSnapshots) ? rawSnapshots : []).filter((item) => item && typeof item === "object" && Array.isArray(item.changedKeys) && item.createdAt).map((item) => includeConfig ? redactConfigSnapshotSecrets(item) : {
-				id: item.id,
-				createdAt: item.createdAt,
-				reason: item.reason,
-				section: item.section,
-				actor: item.actor,
-				source: item.source,
-				note: item.note || "",
-				changedKeys: [...item.changedKeys],
-				changeCount: Number(item.changeCount) || item.changedKeys.length || 0
-			});
-		},
-		async getConfigSnapshotsForRead(kv, options = {}) {
-			if (!kv) return [];
-			const rawSnapshots = await kernel.readStoredConfigSnapshotsStrict(kv);
-			return kernel.normalizeConfigSnapshotsForResponse(rawSnapshots, options);
-		},
-		async getConfigSnapshotById(kv, snapshotId) {
-			return (await kernel.getConfigSnapshotsForRead(kv, { withConfig: true })).find((item) => item.id === snapshotId) || null;
 		},
 		buildAdminIndexUploadKey(revision = "") {
 			const normalizedRevision = normalizeAdminLocalIndexRevision(revision);
@@ -13792,14 +13644,7 @@ function defineSnapshotMethods(dependencies = {}, kernel = {}) {
 						}, {
 							env,
 							kv,
-							ctx,
-							snapshotMeta: {
-								reason: "upload_admin_index",
-								section: "static_assets_policy",
-								source: "admin_gate_local_upload",
-								actor: "admin",
-								note: persistedRecord.fileName
-							}
+							ctx
 						}),
 						previousConfig: currentConfig,
 						record: persistedRecord
@@ -13840,13 +13685,7 @@ function defineSnapshotMethods(dependencies = {}, kernel = {}) {
 					}, {
 						env,
 						kv,
-						ctx,
-						snapshotMeta: {
-							reason: "rollback_worker_html_update",
-							section: "static_assets_policy",
-							source: "worker_html_upload",
-							actor: "system"
-						}
+						ctx
 					});
 					return {
 						config: restoredConfig,
@@ -13858,10 +13697,6 @@ function defineSnapshotMethods(dependencies = {}, kernel = {}) {
 					throw error;
 				}
 			});
-		},
-		async clearConfigSnapshots(kv) {
-			if (!kv) return;
-			await kernel.writeStoredConfigSnapshots(kv, []);
 		},
 		async captureRuntimeConfigRollbackState(env, kv) {
 			if (!kv) return {
@@ -13910,13 +13745,7 @@ function defineSnapshotMethods(dependencies = {}, kernel = {}) {
 				await kernel.commitRuntimeConfig(previousConfig, {
 					env: options.env,
 					kv: options.kv,
-					ctx: options.ctx,
-					snapshotMeta: {
-						reason: "rollback_config_dns",
-						section: "all",
-						source: "rollback",
-						actor: "system"
-					}
+					ctx: options.ctx
 				});
 			} catch (error) {
 				dnsRestoreError = error;
@@ -13945,33 +13774,14 @@ function defineSnapshotMethods(dependencies = {}, kernel = {}) {
 function defineConfigPersistenceMethods(dependencies = {}, kernel = {}) {
 	const { D1TidyExecutor, D1TidyPlanner, Logger, buildAdminReleaseVendorManifest, normalizeAdminReleaseVendorManifestRecord, validateAdminShellHtmlSource } = dependencies;
 	return {
-		async recordConfigSnapshot(kv, prevConfig, nextConfig, meta = {}) {
-			if (!kv) return null;
-			const diffEntries = getConfigDiffEntries(prevConfig, nextConfig);
-			if (!diffEntries.length) return null;
-			const snapshotMeta = kernel.normalizeConfigSnapshotMeta(meta);
-			const currentSnapshots = await kernel.getConfigSnapshots(kv, { withConfig: true });
-			const snapshot = {
-				id: `cfg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-				createdAt: (/* @__PURE__ */ new Date()).toISOString(),
-				reason: snapshotMeta.reason,
-				section: snapshotMeta.section,
-				actor: snapshotMeta.actor,
-				source: snapshotMeta.source,
-				note: snapshotMeta.note,
-				changedKeys: diffEntries.map((item) => item.key),
-				changeCount: diffEntries.length,
-				config: redactRuntimeConfigSecrets(prevConfig)
-			};
-			const nextSnapshots = [snapshot, ...currentSnapshots].slice(0, Config.Defaults.ConfigSnapshotLimit);
-			await kernel.writeStoredConfigSnapshots(kv, nextSnapshots);
-			return snapshot;
-		},
 		async persistRuntimeConfig(rawConfig, options = {}) {
-			return await runKvDataMutation(options.kv || getKvBinding(options.env))(() => kernel.commitRuntimeConfig(rawConfig, options));
+			return await runKvDataMutation(options.kv || getKvBinding(options.env))(() => kernel.commitRuntimeConfig(rawConfig, {
+				...options,
+				forceKvCommit: true
+			}));
 		},
 		async prepareRuntimeConfigPersistence(rawConfig, options = {}) {
-			const { env, kv, ctx, snapshotMeta } = options;
+			const { env, kv, ctx } = options;
 			if (!kv) {
 				const error = /* @__PURE__ */ new Error("KV namespace is required to persist runtime config");
 				error.code = "KV_NOT_CONFIGURED";
@@ -13994,34 +13804,24 @@ function defineConfigPersistenceMethods(dependencies = {}, kernel = {}) {
 					previousConfig: prevConfig,
 					nextConfig
 				})).filter((plan) => plan.changed === true),
-				snapshotMeta,
 				ctx,
 				kv,
 				env
 			};
 		},
-		async buildRuntimeConfigMutationPlan(kv, prevConfig, nextConfig, snapshotMeta = {}) {
-			const diffEntries = getConfigDiffEntries(prevConfig, nextConfig);
-			const currentSnapshots = (await kernel.readStoredConfigSnapshotsStrict(kv)).map((snapshot) => redactConfigSnapshotSecrets(snapshot));
-			const nextSnapshots = diffEntries.length > 0 ? [kernel.createSyntheticConfigSnapshot(prevConfig, snapshotMeta, {
-				changedKeys: diffEntries.map((item) => item.key),
-				changeCount: diffEntries.length
-			}), ...currentSnapshots].slice(0, Config.Defaults.ConfigSnapshotLimit) : currentSnapshots.slice(0, Config.Defaults.ConfigSnapshotLimit);
+		async buildRuntimeConfigMutationPlan(kv, prevConfig, nextConfig) {
+			const legacySnapshotRecords = await kernel.readLegacyConfigSnapshotRecordsStrict(kv);
 			const configMeta = kernel.normalizeRevisionMeta(buildHashedMetaPayload(nextConfig));
-			const snapshotsMeta = kernel.normalizeRevisionMeta({
-				...buildHashedMetaPayload(nextSnapshots),
-				count: nextSnapshots.length
-			}, { count: 0 });
 			const mutationPlan = [
 				{
-					type: "put",
+					type: "delete",
 					key: kernel.CONFIG_SNAPSHOTS_KEY,
-					value: JSON.stringify(nextSnapshots)
+					value: ""
 				},
 				{
-					type: "put",
+					type: "delete",
 					key: kernel.CONFIG_SNAPSHOTS_META_KEY,
-					value: JSON.stringify(snapshotsMeta)
+					value: ""
 				},
 				{
 					type: "put",
@@ -14039,8 +13839,8 @@ function defineConfigPersistenceMethods(dependencies = {}, kernel = {}) {
 				key,
 				value: ""
 			});
-			const previouslyReferencedRevisions = kernel.collectReferencedAdminIndexUploadRevisions(prevConfig, currentSnapshots);
-			const retainedRevisions = kernel.collectReferencedAdminIndexUploadRevisions(nextConfig, nextSnapshots);
+			const previouslyReferencedRevisions = kernel.collectReferencedAdminIndexUploadRevisions(prevConfig, legacySnapshotRecords);
+			const retainedRevisions = kernel.collectReferencedAdminIndexUploadRevisions(nextConfig, []);
 			for (const revision of previouslyReferencedRevisions) {
 				if (retainedRevisions.has(revision)) continue;
 				mutationPlan.push({
@@ -14052,7 +13852,8 @@ function defineConfigPersistenceMethods(dependencies = {}, kernel = {}) {
 			return mutationPlan;
 		},
 		async commitRuntimeConfig(rawConfig, options = {}) {
-			const { prevConfig, nextConfig, configuredHost, dnsPlans, snapshotMeta, ctx, kv, env } = await kernel.prepareRuntimeConfigPersistence(rawConfig, options);
+			const { prevConfig, nextConfig, configuredHost, dnsPlans, ctx, kv, env } = await kernel.prepareRuntimeConfigPersistence(rawConfig, options);
+			assertExpectedRuntimeConfigRevision(options.expectedConfigRevision, prevConfig);
 			if (serializeConfigValue(prevConfig) === serializeConfigValue(nextConfig)) {
 				await kernel.ensureConfigMeta(kv, nextConfig, { ctx });
 				return nextConfig;
@@ -14074,7 +13875,7 @@ function defineConfigPersistenceMethods(dependencies = {}, kernel = {}) {
 					activeDnsPlan = null;
 				}
 				configMutationStarted = true;
-				const mutationPlan = await kernel.buildRuntimeConfigMutationPlan(kv, prevConfig, nextConfig, snapshotMeta);
+				const mutationPlan = await kernel.buildRuntimeConfigMutationPlan(kv, prevConfig, nextConfig);
 				await kernel.applyKvMutationsWithRollback(kv, mutationPlan);
 				if (env) primeRuntimeConfigCache(env, nextConfig);
 				else invalidateRuntimeConfigCache();
@@ -14131,14 +13932,7 @@ function defineConfigPersistenceMethods(dependencies = {}, kernel = {}) {
 			}, {
 				env,
 				kv,
-				ctx,
-				snapshotMeta: {
-					reason: "sync_node_shortcut_selections",
-					section: "proxy",
-					source: String(options.source || "node_mutation"),
-					actor: "admin",
-					note: String(options.note || "").trim()
-				}
+				ctx
 			});
 		},
 		async commitSingleNodeMainVideoStreamShortcutShadowWithinMutation(env, kv, ctx, options = {}) {
@@ -14159,14 +13953,7 @@ function defineConfigPersistenceMethods(dependencies = {}, kernel = {}) {
 			}, {
 				env,
 				kv,
-				ctx,
-				snapshotMeta: {
-					reason: "sync_main_video_stream_shortcuts",
-					section: "proxy",
-					source: String(options.source || "node_save"),
-					actor: "admin",
-					note: String(options.note || nodeName || "").trim()
-				}
+				ctx
 			});
 		}
 	};
@@ -15756,36 +15543,52 @@ function defineNodeMutationMethods(dependencies = {}, kernel = {}) {
 function defineNodeRepositoryMethods(dependencies = {}, kernel = {}) {
 	const { CacheManager, persistCloudflareDnsRecordsForHost } = dependencies;
 	return {
-		async pingTarget(target, timeoutMs, options = {}) {
-			const controller = new AbortController();
+		async pingTarget(target, timeoutMs) {
 			const startedAt = nowMs();
-			const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+			const probePath = DEFAULT_NODE_LINE_HEAD_PROBE_PATH$1;
+			const buildResult = (result = {}) => ({
+				ok: result.ok === true,
+				reason: String(result.reason || "network_error"),
+				statusCode: Number.isInteger(result.statusCode) ? result.statusCode : null,
+				elapsedMs: Math.max(0, nowMs() - startedAt),
+				methodUsed: result.methodUsed === "HEAD" || result.methodUsed === "GET" ? result.methodUsed : null,
+				probePath
+			});
+			const targetRecord = createTargetRecord(String(target || "").trim());
+			if (!targetRecord) return buildResult({ reason: "invalid_target" });
+			const probeUrl = buildProbeUpstreamUrl(targetRecord, probePath);
+			if (!probeUrl) return buildResult({ reason: "invalid_target" });
+			const controller = new AbortController();
+			let timedOut = false;
+			const methodUsed = "GET";
+			const timeoutId = setTimeout(() => {
+				timedOut = true;
+				controller.abort();
+			}, timeoutMs);
 			try {
-				const targetRecord = createTargetRecord(String(target || "").trim());
-				if (!targetRecord) return 9999;
-				const probePath = normalizeNodeLineHeadProbePath(options?.probePath, DEFAULT_NODE_LINE_HEAD_PROBE_PATH$1);
-				const probeUrl = buildProbeUpstreamUrl(targetRecord, probePath);
-				if (!probeUrl) return 9999;
-				let response = await fetchRequest(probeUrl.toString(), {
-					method: "HEAD",
+				const response = await fetchRequest(probeUrl.toString(), {
+					method: "GET",
 					signal: controller.signal
 				});
-				if (response.status === 405 || response.status === 501) {
-					try {
-						response.body?.cancel?.();
-					} catch {}
-					response = await fetchRequest(probeUrl.toString(), {
-						method: "GET",
-						signal: controller.signal
-					});
-				}
-				const healthy = response.ok;
+				const statusCode = Number(response.status);
 				try {
 					response.body?.cancel?.();
 				} catch {}
-				return healthy ? nowMs() - startedAt : 9999;
-			} catch {
-				return 9999;
+				return buildResult({
+					ok: response.ok,
+					reason: response.ok ? "ok" : "http_error",
+					statusCode,
+					methodUsed
+				});
+			} catch (error) {
+				const errorText = [error?.name, error?.message, error?.cause?.name, error?.cause?.message]
+					.map((value) => String(value || ""))
+					.join(" ");
+				const tlsError = /\b(?:tls|ssl|x509|certificate|handshake)\b/i.test(errorText);
+				return buildResult({
+					reason: timedOut ? "timeout" : tlsError ? "tls_error" : "network_error",
+					methodUsed
+				});
 			} finally {
 				clearTimeout(timeoutId);
 			}
@@ -15832,6 +15635,12 @@ function defineNodeRepositoryMethods(dependencies = {}, kernel = {}) {
 						return null;
 					}
 					const { data: normalized, changed } = kernel.normalizeNode(nodeName, nodeData);
+					const resourceViolation = getNodeResourceLimitViolation(nodeName, normalized);
+					if (resourceViolation) {
+						state.NodeCache.delete(nodeName);
+						state.PlaybackRouteHotCache.delete(nodeName);
+						return normalized;
+					}
 					if (changed) {
 						const task = kv.put(`${kernel.PREFIX}${nodeName}`, JSON.stringify(normalized));
 						if (ctx) ctx.waitUntil(task);
@@ -15882,6 +15691,11 @@ function defineNodeRepositoryMethods(dependencies = {}, kernel = {}) {
 				if (getNodeCacheToken(nodeName, state) !== nodeLoadToken) return null;
 				if (!nodeData) return null;
 				const normalized = kernel.normalizeNode(nodeName, nodeData).data;
+				if (getNodeResourceLimitViolation(nodeName, normalized)) {
+					state.NodeCache.delete(nodeName);
+					state.PlaybackRouteHotCache.delete(nodeName);
+					return normalized;
+				}
 				const currentNodesRevision = await kernel.getNodesRevision(kv);
 				if (getNodeCacheToken(nodeName, state) !== nodeLoadToken) return null;
 				setBoundedMapEntry(state.NodeCache, nodeName, {
@@ -16079,6 +15893,7 @@ function buildLogQueryPlanner(dependencies = {}) {
 					useFtsKeyword = true;
 				} else {
 					const likeKeyword = `%${escapeSqlLike(keyword)}%`;
+					if (getUtf8ByteLength(likeKeyword) > D1_LIKE_PATTERN_MAX_BYTES) return { errorResponse: jsonError("LOG_QUERY_KEYWORD_TOO_LONG", "LIKE 搜索关键词过长", 400, { maxPatternBytes: D1_LIKE_PATTERN_MAX_BYTES }) };
 					const likeClauses = [
 						"proxy_logs.node_name LIKE ? ESCAPE '\\'",
 						"proxy_logs.request_path LIKE ? ESCAPE '\\'",
@@ -16229,7 +16044,6 @@ function buildLogger(dependencies = {}) {
 				if (logState.LogFlushTask === flushTask) logState.LogFlushTask = null;
 				logState.LogFlushPending = false;
 				logState.LogLastFlushAt = nowMs();
-				if (logState.LogQueue.length > 0) logger.scheduleFlush(env, ctx);
 			});
 			logState.LogFlushTask = flushTask;
 			ctx.waitUntil(flushTask);
@@ -16391,17 +16205,26 @@ function buildLogger(dependencies = {}) {
 					if (!chunk.length) continue;
 					activeBatchSize = chunk.length;
 					activeBatchWrittenCount = 0;
-					const statements = chunk.map((item) => db.prepare(`INSERT INTO proxy_logs (timestamp, node_name, request_path, request_method, status_code, response_time, client_ip, inbound_colo, outbound_colo, user_agent, referer, category, error_detail, detail_json, created_at)
-            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-            WHERE ? > COALESCE((
-              SELECT CAST(json_extract(payload, '$.clearEpochMs') AS INTEGER)
-              FROM ${SYS_STATUS_TABLE$1}
-              WHERE scope = ?
-              LIMIT 1
-            ), 0)`).bind(item.timestamp, item.nodeName, item.requestPath, item.requestMethod, item.statusCode, item.responseTime, item.clientIp, item.inboundColo, item.outboundColo, item.userAgent, item.referer, item.category, item.errorDetail, item.detailJson, item.createdAt, item.timestamp, logScope));
+					const payload = JSON.stringify(chunk);
+					if (getUtf8ByteLength(payload) > D1_SAFE_SERIALIZED_VALUE_MAX_BYTES) throw createD1SerializedValueTooLargeError("proxy_logs.batch", payload);
+					const statement = db.prepare(`INSERT INTO proxy_logs (timestamp, node_name, request_path, request_method, status_code, response_time, client_ip, inbound_colo, outbound_colo, user_agent, referer, category, error_detail, detail_json, created_at)
+						SELECT
+							CAST(json_extract(entry.value, '$.timestamp') AS INTEGER),
+							json_extract(entry.value, '$.nodeName'), json_extract(entry.value, '$.requestPath'), json_extract(entry.value, '$.requestMethod'),
+							CAST(json_extract(entry.value, '$.statusCode') AS INTEGER), CAST(json_extract(entry.value, '$.responseTime') AS INTEGER),
+							json_extract(entry.value, '$.clientIp'), json_extract(entry.value, '$.inboundColo'), json_extract(entry.value, '$.outboundColo'),
+							json_extract(entry.value, '$.userAgent'), json_extract(entry.value, '$.referer'), json_extract(entry.value, '$.category'),
+							json_extract(entry.value, '$.errorDetail'), json_extract(entry.value, '$.detailJson'), json_extract(entry.value, '$.createdAt')
+						FROM json_each(?) AS entry
+						WHERE CAST(json_extract(entry.value, '$.timestamp') AS INTEGER) > COALESCE((
+							SELECT CAST(json_extract(payload, '$.clearEpochMs') AS INTEGER)
+							FROM ${SYS_STATUS_TABLE$1}
+							WHERE scope = ?
+							LIMIT 1
+						), 0)`).bind(payload, logScope);
 					let attempt = 0;
 					while (true) try {
-						await db.batch(statements);
+						await statement.run();
 						break;
 					} catch (error) {
 						if (attempt >= maxRetryCount) throw error;
@@ -16500,8 +16323,10 @@ function defineDatabaseStatusMethods(dependencies = {}) {
 		async putOpsStatusPayloadToDb(db, scope, payload, updatedAtMs) {
 			if (!db || !scope || !payload || typeof payload !== "object") return false;
 			if (!await statusPersistence.ensureSysStatusTable(db)) return false;
+			const payloadText = JSON.stringify(payload);
+			if (getUtf8ByteLength(payloadText) > D1_SAFE_SERIALIZED_VALUE_MAX_BYTES) return false;
 			await db.prepare(`INSERT INTO ${SYS_STATUS_TABLE} (scope, payload, updated_at) VALUES (?, ?, ?)
-        ON CONFLICT(scope) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at`).bind(scope, JSON.stringify(payload), Number(updatedAtMs) || nowMs()).run();
+		ON CONFLICT(scope) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at`).bind(scope, payloadText, Number(updatedAtMs) || nowMs()).run();
 			statusPersistence.cacheOpsStatusPayload(db, scope, payload);
 			return true;
 		},
@@ -17536,7 +17361,6 @@ function defineProxyUpstreamDeliveryMethods(dependencies = {}, kernel = {}) {
 			};
 			if (!shouldManageProxyBody) {
 				kernel.recordAccessLog(execution, successLogPayload);
-				await kernel.flushCriticalLogsIfNeeded(execution);
 			}
 			if (execution.metadataCacheKey && execution.ctx && finalUpstreamState.response.status === 200) {
 				const cacheClone = finalUpstreamState.response.clone();
@@ -17550,7 +17374,7 @@ function defineProxyUpstreamDeliveryMethods(dependencies = {}, kernel = {}) {
 			if (execution.requestTraits.isPlaybackInfoRequest === true) {
 				await kernel.storePlaybackInfoResponseCache(execution, finalUpstreamState.response, null, finalUpstreamState.playbackInfoRepresentation);
 			}
-			await kernel.maybePrewarmMetadataResponse(execution.request, finalUpstreamState.response, execution.requestTraits, finalUpstreamState.activeTargetBase, buildFetchOptions, execution.nodeName, execution.nodeKey, execution.requestUrl, execution.ctx, {
+			kernel.scheduleMetadataPrewarmResponse(execution.request, finalUpstreamState.response, execution.requestTraits, finalUpstreamState.activeTargetBase, buildFetchOptions, execution.nodeName, execution.nodeKey, execution.requestUrl, execution.ctx, {
 				proxyPath: execution.proxyPath,
 				prewarmCacheTtl: execution.requestTraits.prewarmCacheTtl,
 				imageCacheMaxAge: execution.imageCacheMaxAge,
@@ -17867,9 +17691,9 @@ function defineProxyDiagnosticMethods(dependencies = {}, kernel = {}) {
 			return parts.join(" | ");
 		},
 		buildTargetHotCacheDiagnosticDetail(execution) {
-			const cacheState = String(execution?.targetHotCacheState || "").trim();
+			const cacheState = String(execution?.nodeCacheState || execution?.targetHotCacheState || "").trim();
 			if (!cacheState) return "";
-			return `TargetHotCache=${cacheState}`;
+			return execution?.nodeCacheState ? `NodeCacheState=${cacheState}` : `TargetHotCache=${cacheState}`;
 		},
 		buildRouteContextDiagnosticDetail(execution) {
 			const routeContextDiagnostics = execution?.routeContextDiagnostics && typeof execution.routeContextDiagnostics === "object" ? execution.routeContextDiagnostics : null;
@@ -18005,6 +17829,7 @@ function defineProxyDiagnosticMethods(dependencies = {}, kernel = {}) {
 				preferredTarget: String(options.preferredTarget || failoverTelemetry.preferredTarget || "").trim() || null,
 				fastFailReason: String(options.fastFailReason || failoverTelemetry.fastFailReason || "").trim() || null,
 				targetHotCache: String(options.targetHotCache || execution?.targetHotCacheState || "").trim() || null,
+				nodeCacheState: String(options.nodeCacheState || execution?.nodeCacheState || "").trim() || null,
 				playbackInfoCache: String(options.playbackInfoCache || execution?.playbackInfoCacheState || "").trim() || null,
 				playbackInfoCacheTtlSec: Number.isFinite(Number(options.playbackInfoCacheTtlSec)) ? Math.max(0, Math.trunc(Number(options.playbackInfoCacheTtlSec))) : Math.max(0, Math.trunc(Number(execution?.playbackInfoCacheTtlSec) || 0)),
 				playbackInfoMode: execution?.requestTraits?.isPlaybackInfoRequest === true ? normalizeDefaultPlaybackInfoMode(options.playbackInfoMode || execution?.effectivePlaybackInfoMode) : null,
@@ -18153,25 +17978,88 @@ function defineProxyMetadataResponseMethods(dependencies = {}, kernel = {}) {
 			});
 			return [...candidates.values()].sort((a, b) => rankMetadataWarmPath(a.proxyPath) - rankMetadataWarmPath(b.proxyPath)).slice(0, 4);
 		},
-		async maybePrewarmMetadataResponse(request, response, requestTraits, activeTargetBase, buildFetchOptions, name, key, requestUrl, ctx, options = {}) {
+		buildBudgetedPrewarmResponse(response, maxBytes) {
+			const limit = Math.max(0, Math.floor(Number(maxBytes) || 0));
+			const declaredBytes = parseContentLengthHeader(response?.headers?.get("Content-Length"));
+			if (limit <= 0 || Number.isFinite(declaredBytes) && declaredBytes > limit) {
+				try { Promise.resolve(response?.body?.cancel?.()).catch(() => {}); } catch {}
+				return null;
+			}
+			if (!response?.body) return { response, getBytes: () => 0 };
+			const reader = response.body.getReader();
+			let bytes = 0;
+			let closed = false;
+			const release = () => {
+				if (closed) return;
+				closed = true;
+				try { reader.releaseLock(); } catch {}
+			};
+			const body = new ReadableStream({
+				async pull(controller) {
+					try {
+						const { done, value } = await reader.read();
+						if (done) {
+							release();
+							controller.close();
+							return;
+						}
+						const chunk = value instanceof Uint8Array ? value : new Uint8Array(value || 0);
+						if (bytes + chunk.byteLength > limit) {
+							try { await reader.cancel("metadata_prewarm_budget_exceeded"); } catch {}
+							release();
+							controller.error(new Error("metadata_prewarm_budget_exceeded"));
+							return;
+						}
+						bytes += chunk.byteLength;
+						controller.enqueue(chunk);
+					} catch (error) {
+						release();
+						controller.error(error);
+					}
+				},
+				async cancel(reason) {
+					try { await reader.cancel(reason); } catch {}
+					release();
+				}
+			});
+			return {
+				response: new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers }),
+				getBytes: () => bytes
+			};
+		},
+		async runMetadataPrewarmSingleFlight(cacheKey, task) {
+			const tasks = cacheState.MetadataPrewarmTasks;
+			const taskKey = cacheKey instanceof Request ? cacheKey.url : String(cacheKey || "");
+			if (!taskKey) return { skipped: true, result: null };
+			const existing = tasks.get(taskKey);
+			if (existing) return { joined: true, result: await existing };
+			if (tasks.size >= METADATA_PREWARM_MAX_IN_FLIGHT) return { skipped: true, result: null };
+			const promise = Promise.resolve().then(task).finally(() => {
+				if (tasks.get(taskKey) === promise) tasks.delete(taskKey);
+			});
+			tasks.set(taskKey, promise);
+			return { joined: false, result: await promise };
+		},
+		scheduleMetadataPrewarmResponse(request, response, requestTraits, activeTargetBase, buildFetchOptions, name, key, requestUrl, ctx, options = {}) {
 			if (!ctx || request.method !== "GET" || requestTraits.enablePrewarm !== true) return;
 			if (requestTraits.isPlaybackInfoRequest === true) return;
 			if (requestTraits.isImage || requestTraits.isSubtitle || requestTraits.isManifest || requestTraits.isSegment || requestTraits.isBigStream) return;
 			if (!(response.status >= 200 && response.status < 300)) return;
 			if (!isJsonHttpMediaType(response.headers.get("Content-Type"))) return;
-			const bodyResult = await readResponseTextWithLimit(response.clone(), METADATA_PREWARM_RESPONSE_MAX_BYTES);
-			if (bodyResult.exceeded) return;
-			let payload;
-			try {
-				payload = JSON.parse(bodyResult.text);
-			} catch {
-				return;
-			}
-			const targets = kernel.buildMetadataPrewarmTargets(options.proxyPath, payload, activeTargetBase, name, key, requestTraits.prewarmDepth);
-			if (!targets.length) return;
-			ctx.waitUntil((async () => {
+			let responseClone;
+			try { responseClone = response.clone(); } catch { return; }
+			const task = (async () => {
+				const bodyResult = await readResponseTextWithLimit(responseClone, METADATA_PREWARM_RESPONSE_MAX_BYTES);
+				if (bodyResult.exceeded) return;
+				let payload;
+				try { payload = JSON.parse(bodyResult.text); } catch { return; }
+				const targets = kernel.buildMetadataPrewarmTargets(options.proxyPath, payload, activeTargetBase, name, key, requestTraits.prewarmDepth);
+				if (!targets.length) return;
 				const cache = getDefaultCacheHandle();
+				if (!cache) return;
+				let remainingBytes = clampIntegerConfig(requestTraits.prewarmPrefetchBytes, Config.Defaults.PrewarmPrefetchBytes, 0, METADATA_PREWARM_MAX_PREFETCH_BYTES);
 				for (const target of targets) {
+					if (remainingBytes <= 0) break;
 					if (!shouldWorkerCacheMetadataUrl(target.upstreamUrl)) continue;
 					const identityPartition = await buildWorkerMetadataPrewarmIdentityPartition(request, target.upstreamUrl);
 					const cacheKey = buildCanonicalWorkerMetadataCacheKey(requestUrl, name, key, target.proxyPath, {
@@ -18181,42 +18069,50 @@ function defineProxyMetadataResponseMethods(dependencies = {}, kernel = {}) {
 						identityPartition,
 						cachePolicyRevision: buildWorkerMetadataCachePolicyRevision(target.proxyPath, options)
 					});
+					if (!cacheKey) continue;
 					if (cache && cacheKey) try {
 						if (await cache.match(cacheKey)) continue;
 					} catch {}
 					try {
-						const prewarmOptions = await buildFetchOptions(target.upstreamUrl, { method: "GET" });
-						prewarmOptions.cache = "no-store";
-						const prewarmHeaders = new Headers(prewarmOptions.headers);
-						prewarmHeaders.delete("Range");
-						prewarmHeaders.delete("If-Modified-Since");
-						prewarmHeaders.delete("If-None-Match");
-						prewarmHeaders.set("X-Metadata-Prewarm", "1");
-						prewarmOptions.headers = prewarmHeaders;
-						const prewarmTimeoutMs = clampIntegerConfig(options.prewarmTimeoutMs, DEFAULT_METADATA_PREWARM_TIMEOUT_MS, 250, 1e4);
-						let timeoutId = null;
-						try {
-							if (prewarmTimeoutMs > 0) {
-								const controller = new AbortController();
-								prewarmOptions.signal = controller.signal;
-								timeoutId = setTimeout(() => controller.abort(), prewarmTimeoutMs);
+						const flight = await kernel.runMetadataPrewarmSingleFlight(cacheKey, async () => {
+							const prewarmOptions = await buildFetchOptions(target.upstreamUrl, { method: "GET" });
+							prewarmOptions.cache = "no-store";
+							const prewarmHeaders = new Headers(prewarmOptions.headers);
+							prewarmHeaders.delete("Range");
+							prewarmHeaders.delete("If-Modified-Since");
+							prewarmHeaders.delete("If-None-Match");
+							prewarmHeaders.set("X-Metadata-Prewarm", "1");
+							prewarmOptions.headers = prewarmHeaders;
+							const controller = new AbortController();
+							prewarmOptions.signal = controller.signal;
+							const timeoutMs = clampIntegerConfig(options.prewarmTimeoutMs, DEFAULT_METADATA_PREWARM_TIMEOUT_MS, 250, 1e4);
+							const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+							try {
+								const upstream = await fetchRequest(target.upstreamUrl.toString(), prewarmOptions);
+								if (upstream.status !== 200) {
+									try { await upstream.body?.cancel?.(); } catch {}
+									return { cached: false, bytes: 0 };
+								}
+								const bounded = kernel.buildBudgetedPrewarmResponse(upstream, remainingBytes);
+								if (!bounded) return { cached: false, bytes: 0 };
+								const warmTraits = {
+									isImage: EMBY_IMAGE_PATH_REGEX.test(target.proxyPath) || IMAGE_FILE_EXTENSION_REGEX.test(target.proxyPath),
+									isSubtitle: SUBTITLE_EXTENSION_REGEX.test(target.proxyPath),
+									isManifest: STREAM_MANIFEST_EXTENSION_REGEX.test(target.proxyPath)
+								};
+								const cached = await kernel.storeMetadataCache(cacheKey, bounded.response, warmTraits, { ...options, sourceUrl: target.upstreamUrl });
+								return { cached, bytes: bounded.getBytes() };
+							} finally {
+								clearTimeout(timeoutId);
+								controller.abort();
 							}
-							const prewarmResponse = await fetchRequest(target.upstreamUrl.toString(), prewarmOptions);
-							const warmTraits = {
-								isImage: EMBY_IMAGE_PATH_REGEX.test(target.proxyPath) || IMAGE_FILE_EXTENSION_REGEX.test(target.proxyPath),
-								isSubtitle: SUBTITLE_EXTENSION_REGEX.test(target.proxyPath),
-								isManifest: STREAM_MANIFEST_EXTENSION_REGEX.test(target.proxyPath)
-							};
-							await kernel.storeMetadataCache(cacheKey, prewarmResponse, warmTraits, {
-								...options,
-								sourceUrl: target.upstreamUrl
-							});
-						} finally {
-							if (timeoutId !== null) clearTimeout(timeoutId);
-						}
+						});
+						if (!flight.joined && flight.result) remainingBytes = Math.max(0, remainingBytes - (Number(flight.result.bytes) || 0));
 					} catch {}
 				}
-			})());
+			})().catch(() => {});
+			ctx.waitUntil(task);
+			return task;
 		},
 		shouldRetryWithProtocolFallback(response, state = {}) {
 			if (response.status !== 403) return false;
@@ -18226,11 +18122,13 @@ function defineProxyMetadataResponseMethods(dependencies = {}, kernel = {}) {
 			if (state.preparedBodyMode === "stream") return false;
 			return true;
 		},
-		resolveResponseStreamIdleTimeoutMs(requestTraits, upstreamTimeoutMs) {
+		resolveResponseStreamIdleTimeoutMs(requestTraits) {
+			if (requestTraits?.isManifest === true) return Config.Defaults.ProxyPlaylistIdleTimeoutMs;
+			if (requestTraits?.isSegment === true) return Config.Defaults.ProxyStreamIdleTimeoutMs;
 			return 0;
 		},
 		shouldManageProxyResponseBody(execution, upstreamState) {
-			return execution.requestTraits.isSegment === true && execution.requestMethod !== "HEAD" && upstreamState.response.status !== 101 && !!upstreamState.response.body;
+			return (execution.requestTraits.isSegment === true || execution.requestTraits.isManifest === true) && execution.requestMethod !== "HEAD" && upstreamState.response.status !== 101 && !!upstreamState.response.body;
 		},
 		buildPassthroughProxyResponseBody(execution, upstreamState) {
 			const upstreamBody = execution.requestMethod === "HEAD" ? null : upstreamState.response.body;
@@ -18381,6 +18279,7 @@ function defineProxyMetadataResponseMethods(dependencies = {}, kernel = {}) {
 								return;
 							}
 							controller.enqueue(value);
+							armIdleTimer();
 						} catch (error) {
 							clearIdleTimer();
 							const abortReason = requestLifecycle.getAbortReason();
@@ -18729,21 +18628,6 @@ function defineProxyAccessLogMethods(dependencies = {}, kernel = {}) {
 			};
 			Logger.record(execution.env, execution.ctx, logData);
 		},
-		async flushCriticalLogsIfNeeded(execution) {
-			const requestTraits = execution?.requestTraits || {};
-			if (!(requestTraits.isPlaybackInfoRequest === true || requestTraits.isPlaybackSessionControlRequest === true)) return;
-			const currentConfig = execution?.currentConfig || {};
-			if (currentConfig.logEnabled === false) return;
-			const configuredDelayMinutes = Number(currentConfig.logWriteDelayMinutes);
-			if (Math.max(0, Number.isFinite(configuredDelayMinutes) ? configuredDelayMinutes * 6e4 : Config.Defaults.LogFlushDelayMinutes * 6e4) !== 0) return;
-			const logState = logBindingStates.get(execution?.env ? kernel.getDB(execution.env) : null);
-			if (logState.LogFlushTask) try {
-				await logState.LogFlushTask;
-			} catch {}
-			if (logState.LogQueue.length > 0) try {
-				await Logger.flush(execution.env);
-			} catch {}
-		},
 		buildOptionsResponse(execution) {
 			const headers = new Headers(execution.dynamicCors);
 			applySecurityHeaders(headers);
@@ -18854,6 +18738,7 @@ function definePlaybackExecutionCacheMethods(dependencies = {}, kernel = {}) {
 			const upstreamTimeoutMs = clampIntegerConfig(currentConfig.upstreamTimeoutMs, DEFAULT_UPSTREAM_TIMEOUT_MS, 0, 18e4);
 			const upstreamRetryAttempts = clampIntegerConfig(currentConfig.upstreamRetryAttempts, DEFAULT_UPSTREAM_RETRY_ATTEMPTS, 0, 3);
 			const hedgeFailoverEnabled = currentConfig.hedgeFailoverEnabled === true;
+			const hedgeProbePreferGet = currentConfig.hedgeProbePreferGet !== false;
 			const hedgeProbePath = resolveEffectiveNodeHedgeProbePath(node, currentConfig);
 			const hedgeProbeTimeoutMs = clampIntegerConfig(currentConfig.hedgeProbeTimeoutMs, DEFAULT_HEDGE_PROBE_TIMEOUT_MS, 250, 1e4);
 			const hedgeProbeParallelism = clampIntegerConfig(currentConfig.hedgeProbeParallelism, DEFAULT_HEDGE_PROBE_PARALLELISM, 1, 2);
@@ -18937,6 +18822,7 @@ function definePlaybackExecutionCacheMethods(dependencies = {}, kernel = {}) {
 				upstreamTimeoutMs,
 				upstreamRetryAttempts,
 				hedgeFailoverEnabled,
+				hedgeProbePreferGet,
 				hedgeProbePath,
 				hedgeProbeTimeoutMs,
 				hedgeProbeParallelism,
@@ -18960,6 +18846,7 @@ function definePlaybackExecutionCacheMethods(dependencies = {}, kernel = {}) {
 				rewritePlaybackEntry,
 				playbackRelayTargetUrl: playbackRelay?.targetUrl instanceof URL ? playbackRelay.targetUrl : null,
 				targetHotCacheState: String(options.targetHotCacheState || "").trim() || (requestTraits.isPlaybackCriticalRequest === true ? "miss" : "skip"),
+				nodeCacheState: String(options.nodeCacheState || "").trim(),
 				playbackRouteHotTargetRecords: Array.isArray(options.cachedTargetRecords) ? options.cachedTargetRecords : null,
 				videoProgressForwardEnabled,
 				videoProgressForwardIntervalSec,
@@ -19208,6 +19095,7 @@ function definePlaybackProgressRelayMethods(dependencies = {}, kernel = {}) {
 				pendingSnapshot: null,
 				scheduledFlushAt: 0,
 				scheduledPromise: null,
+				cancelScheduledDelay: null,
 				activeFlushPromise: null,
 				terminalState: "",
 				terminalAt: 0,
@@ -19231,13 +19119,19 @@ function definePlaybackProgressRelayMethods(dependencies = {}, kernel = {}) {
 			entry.waitUntilCtx = execution?.ctx || entry.waitUntilCtx || null;
 			entry.nodeName = String(execution?.nodeName || entry.nodeName || "").trim().toLowerCase();
 			entry.nodeRevision = String(execution?.nodeDerivedCacheRevision || entry.nodeRevision || "").trim();
+			try { entry.cancelScheduledDelay?.(); } catch {}
+			entry.cancelScheduledDelay = null;
+			entry.scheduledPromise = null;
 			entry.pendingSnapshot = null;
 			entry.scheduledFlushAt = 0;
 			entry.terminalState = "stopped";
 			entry.terminalAt = stoppedAt;
 			entry.terminalTombstoneUntil = stoppedAt + kernel.getPlaybackProgressRelayTerminalTtlMs(entry.intervalMs);
 			entry.lastTouchedAt = stoppedAt;
-			setBoundedPlaybackProgressRelayEntry(sessionKey, entry);
+			if (!setBoundedPlaybackProgressRelayEntry(sessionKey, entry)) {
+				releasePlaybackProgressRelayEntry(entry);
+				return null;
+			}
 			return entry;
 		},
 		cleanupPlaybackProgressRelay(now = nowMs()) {
@@ -19256,7 +19150,11 @@ function definePlaybackProgressRelayMethods(dependencies = {}, kernel = {}) {
 			}
 			const maxEntries = Math.max(1, Number(Config.Defaults.VideoProgressForwardSessionMax) || 1);
 			while (relayMap.size > maxEntries) {
-				const oldestKey = relayMap.keys().next().value;
+				let oldestKey = "";
+				for (const [candidateKey, candidate] of relayMap) if (!candidate?.activeFlushPromise) {
+					oldestKey = candidateKey;
+					break;
+				}
 				if (!oldestKey) break;
 				deletePlaybackProgressRelayEntry(oldestKey);
 			}
@@ -19286,8 +19184,9 @@ function definePlaybackProgressRelayMethods(dependencies = {}, kernel = {}) {
 			const dueAt = Math.max(nowMs(), Number(entry.lastForwardAt) || 0) + intervalMs;
 			entry.scheduledFlushAt = dueAt;
 			entry.lastTouchedAt = nowMs();
+			const delay = createCancelableDelay(Math.max(0, dueAt - nowMs()));
 			const waitPromise = (async () => {
-				await sleepMs(Math.max(0, dueAt - nowMs()));
+				if (!await delay.promise) return;
 				const currentEntry = cacheState.PlaybackProgressRelay.get(sessionKey);
 				if (!currentEntry || currentEntry !== entry || Number(currentEntry.scheduledFlushAt) !== dueAt) return;
 				currentEntry.scheduledFlushAt = 0;
@@ -19295,8 +19194,13 @@ function definePlaybackProgressRelayMethods(dependencies = {}, kernel = {}) {
 					background: true,
 					attachToCtx: false
 				});
-			})();
+			})().finally(() => {
+				if (entry.scheduledPromise !== waitPromise) return;
+				entry.scheduledPromise = null;
+				entry.cancelScheduledDelay = null;
+			});
 			entry.scheduledPromise = waitPromise;
+			entry.cancelScheduledDelay = delay.cancel;
 			const waitUntilCtx = entry.waitUntilCtx || entry.pendingSnapshot?.ctx || null;
 			if (waitUntilCtx?.waitUntil) waitUntilCtx.waitUntil(waitPromise);
 		},
@@ -19333,6 +19237,9 @@ function definePlaybackProgressRelayMethods(dependencies = {}, kernel = {}) {
 			if (!entry.pendingSnapshot) return false;
 			const snapshot = entry.pendingSnapshot;
 			entry.pendingSnapshot = null;
+			try { entry.cancelScheduledDelay?.(); } catch {}
+			entry.cancelScheduledDelay = null;
+			entry.scheduledPromise = null;
 			entry.scheduledFlushAt = 0;
 			entry.lastForwardAt = nowMs();
 			entry.lastTouchedAt = entry.lastForwardAt;
@@ -19369,6 +19276,9 @@ function definePlaybackProgressRelayMethods(dependencies = {}, kernel = {}) {
 				await entry.activeFlushPromise;
 			} catch {}
 			if (!entry.pendingSnapshot) return false;
+			try { entry.cancelScheduledDelay?.(); } catch {}
+			entry.cancelScheduledDelay = null;
+			entry.scheduledPromise = null;
 			entry.scheduledFlushAt = 0;
 			return await kernel.flushPlaybackProgressRelayEntry(sessionKey, {
 				background: false,
@@ -19449,7 +19359,11 @@ function definePlaybackProgressRelayMethods(dependencies = {}, kernel = {}) {
 			relayEntry.terminalState = "";
 			relayEntry.terminalAt = 0;
 			relayEntry.terminalTombstoneUntil = 0;
-			setBoundedPlaybackProgressRelayEntry(sessionKey, relayEntry);
+			if (!setBoundedPlaybackProgressRelayEntry(sessionKey, relayEntry)) {
+				releasePlaybackProgressRelayEntry(relayEntry);
+				execution.progressForwardMode = "capacity_bypass";
+				return null;
+			}
 			if (!(relayEntry.lastForwardAt > 0 && now - relayEntry.lastForwardAt < relayEntry.intervalMs) && !relayEntry.activeFlushPromise && !relayEntry.pendingSnapshot) {
 				relayEntry.pendingSnapshot = null;
 				relayEntry.scheduledFlushAt = 0;
@@ -19532,6 +19446,7 @@ function defineProxyRoutingDecisionMethods(dependencies = {}, kernel = {}) {
 				enablePrewarm: currentConfig.enablePrewarm !== false && !legacyEntryOffloadEnabled,
 				prewarmCacheTtl: clampIntegerConfig(currentConfig.prewarmCacheTtl, DEFAULT_PREWARM_CACHE_TTL_SEC, 0, 3600),
 				prewarmDepth: normalizePrewarmDepth(currentConfig.prewarmDepth),
+				prewarmPrefetchBytes: currentConfig.disablePrewarmPrefetch === true ? 0 : clampIntegerConfig(currentConfig.prewarmPrefetchBytes, Config.Defaults.PrewarmPrefetchBytes, 0, METADATA_PREWARM_MAX_PREFETCH_BYTES),
 				isImage,
 				isStaticFile,
 				isSubtitle,
@@ -19962,6 +19877,7 @@ function defineProxyFailoverStateMethods(dependencies = {}, kernel = {}) {
 				orderedTargetSignature,
 				preferredTtlMs,
 				probePath: normalizeHedgeProbePath(execution?.hedgeProbePath, DEFAULT_HEDGE_PROBE_PATH),
+				probePreferGet: execution?.hedgeProbePreferGet !== false,
 				probeTimeoutMs: Math.max(250, Number(execution?.hedgeProbeTimeoutMs) || DEFAULT_HEDGE_PROBE_TIMEOUT_MS),
 				probeParallelism: Math.max(1, Math.min(2, Number(execution?.hedgeProbeParallelism) || DEFAULT_HEDGE_PROBE_PARALLELISM)),
 				waitTimeoutMs: Math.max(250, Number(execution?.hedgeWaitTimeoutMs) || DEFAULT_HEDGE_WAIT_TIMEOUT_MS),
@@ -20099,10 +20015,11 @@ function defineProxyFailoverProbeMethods(dependencies = {}, kernel = {}) {
 			};
 			const startedAt = nowMs();
 			let response = null;
-			let methodUsed = "HEAD";
+			const preferGet = failoverContext?.probePreferGet !== false;
+			let methodUsed = preferGet ? "GET" : "HEAD";
 			try {
-				response = await kernel.performFailoverProbeRequest(execution, probeUrl, "HEAD", probeTimeoutMs, options.parentSignal || null);
-				if (response.status === 405 || response.status === 501) {
+				response = await kernel.performFailoverProbeRequest(execution, probeUrl, methodUsed, probeTimeoutMs, options.parentSignal || null);
+				if (!preferGet && (response.status === 405 || response.status === 501)) {
 					try {
 						response.body?.cancel?.();
 					} catch {}
@@ -20756,19 +20673,21 @@ function defineAnalyticsStatsMethods(dependencies = {}, kernel = {}) {
 			})).filter((row) => row.bucketDate);
 			if (!rows.length) return true;
 			const updatedAt = (/* @__PURE__ */ new Date()).toISOString();
-			const statements = rows.map((row) => db.prepare(`INSERT INTO ${kernel.STATS_HOURLY_TABLE} (
-            bucket_date, bucket_hour, request_count, play_count, playback_info_count, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?)
-          ON CONFLICT(bucket_date, bucket_hour) DO UPDATE SET
-            request_count = ${kernel.STATS_HOURLY_TABLE}.request_count + excluded.request_count,
-            play_count = ${kernel.STATS_HOURLY_TABLE}.play_count + excluded.play_count,
-            playback_info_count = ${kernel.STATS_HOURLY_TABLE}.playback_info_count + excluded.playback_info_count,
-            updated_at = excluded.updated_at`).bind(row.bucketDate, row.bucketHour, row.requestCount, row.playCount, row.playbackInfoCount, updatedAt));
-			if (options.useBatch === false) for (const statement of statements) await statement.run();
-			else {
-				const batchSize = 50;
-				for (let index = 0; index < statements.length; index += batchSize) await db.batch(statements.slice(index, index + batchSize));
-			}
+			const payload = assertD1SerializedValueFits("proxy_stats_hourly.batch", JSON.stringify(rows));
+			const statement = db.prepare(`INSERT INTO ${kernel.STATS_HOURLY_TABLE} (
+				bucket_date, bucket_hour, request_count, play_count, playback_info_count, updated_at
+			)
+			SELECT json_extract(entry.value, '$.bucketDate'), CAST(json_extract(entry.value, '$.bucketHour') AS INTEGER),
+				CAST(json_extract(entry.value, '$.requestCount') AS INTEGER), CAST(json_extract(entry.value, '$.playCount') AS INTEGER),
+				CAST(json_extract(entry.value, '$.playbackInfoCount') AS INTEGER), ?
+			FROM json_each(?) AS entry
+			WHERE 1
+			ON CONFLICT(bucket_date, bucket_hour) DO UPDATE SET
+				request_count = ${kernel.STATS_HOURLY_TABLE}.request_count + excluded.request_count,
+				play_count = ${kernel.STATS_HOURLY_TABLE}.play_count + excluded.play_count,
+				playback_info_count = ${kernel.STATS_HOURLY_TABLE}.playback_info_count + excluded.playback_info_count,
+				updated_at = excluded.updated_at`).bind(updatedAt, payload);
+			await statement.run();
 			return true;
 		},
 		async clearStatsHourly(db) {
@@ -20796,45 +20715,16 @@ function defineAnalyticsStatsMethods(dependencies = {}, kernel = {}) {
 		async rebuildStatsHourlyForDate(db, options = {}) {
 			if (!db) return false;
 			const bucketDate = String(options.bucketDate || "").trim();
-			const startTs = Number(options.startTs) || 0;
-			const endTs = Number(options.endTs) || 0;
-			if (!bucketDate || startTs <= 0 || endTs <= 0 || endTs < startTs) return false;
+			if (!bucketDate) return false;
 			await kernel.ensureStatsHourlySchema(db);
 			await db.prepare(`DELETE FROM ${kernel.STATS_HOURLY_TABLE} WHERE bucket_date = ?`).bind(bucketDate).run();
-			const logsResult = await db.prepare(`SELECT timestamp, request_path, category
-            FROM ${kernel.LOGS_TABLE}
-            WHERE timestamp >= ? AND timestamp <= ?
-            ORDER BY timestamp ASC`).bind(startTs, endTs).all();
-			const normalizedEntries = (Array.isArray(logsResult?.results) ? logsResult.results : []).map((row) => ({
-				timestamp: Number(row?.timestamp) || 0,
-				requestPath: row?.request_path || row?.requestPath || "",
-				category: row?.category || ""
-			}));
-			return await kernel.incrementStatsHourly(db, normalizedEntries, {
-				utcOffsetMinutes: options.utcOffsetMinutes,
-				useBatch: true
-			});
+			return true;
 		},
 		async rebuildStatsHourlyWindow(db, options = {}) {
 			if (!db) return false;
-			const startTs = Number(options.startTs) || 0;
-			const endTs = Number(options.endTs) || 0;
-			if (startTs < 0 || endTs <= 0 || endTs < startTs) return false;
 			await kernel.ensureStatsHourlySchema(db);
 			await kernel.clearStatsHourly(db);
-			const logsResult = await db.prepare(`SELECT timestamp, request_path, category
-            FROM ${kernel.LOGS_TABLE}
-            WHERE timestamp >= ? AND timestamp <= ?
-            ORDER BY timestamp ASC`).bind(startTs, endTs).all();
-			const normalizedEntries = (Array.isArray(logsResult?.results) ? logsResult.results : []).map((row) => ({
-				timestamp: Number(row?.timestamp) || 0,
-				requestPath: row?.request_path || row?.requestPath || "",
-				category: row?.category || ""
-			}));
-			return await kernel.incrementStatsHourly(db, normalizedEntries, {
-				utcOffsetMinutes: options.utcOffsetMinutes,
-				useBatch: true
-			});
+			return true;
 		},
 		async ensureStatsHourlyWindowAligned(envOrStore, options = {}) {
 			const stores = kernel.resolveOpsStatusStores(envOrStore);
@@ -20917,7 +20807,7 @@ function defineAnalyticsStatsMethods(dependencies = {}, kernel = {}) {
 				recreated: false
 			};
 			const forceRecreate = options.forceRecreate === true;
-			await kernel.ensureLogsBaseSchema(db);
+			if (options.baseSchemaReady !== true) await kernel.ensureLogsBaseSchema(db);
 			const readiness = await kernel.getLogsFtsReadiness(db);
 			if (readiness.ready && !forceRecreate) return {
 				migratedRows: 0,
@@ -21084,17 +20974,41 @@ function defineAnalyticsDnsMethods(dependencies = {}, kernel = {}) {
 			}
 			const normalizedItems = [...deduped.values()];
 			if (!normalizedItems.length) return [];
-			const statements = normalizedItems.map((item) => db.prepare(`INSERT INTO ${kernel.DNS_IP_POOL_ITEMS_TABLE} (
+			const payload = JSON.stringify(normalizedItems.map((item) => ({
+				id: item.id,
+				ip: item.ip,
+				ipType: item.ipType,
+				sourceKind: item.sourceKind,
+				sourceLabel: item.sourceLabel,
+				lineLabel: item.lineLabel,
+				remark: item.remark,
+				createdAt: item.createdAt,
+				updatedAt: item.updatedAt
+			})));
+			assertD1SerializedValueFits("dns_ip_pool_items.batch", payload);
+			const statement = db.prepare(`INSERT INTO ${kernel.DNS_IP_POOL_ITEMS_TABLE} (
             id, ip, ip_type, source_kind, source_label, line_label, remark, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          )
+          SELECT
+            json_extract(entry.value, '$.id'),
+            json_extract(entry.value, '$.ip'),
+            json_extract(entry.value, '$.ipType'),
+            json_extract(entry.value, '$.sourceKind'),
+            json_extract(entry.value, '$.sourceLabel'),
+            json_extract(entry.value, '$.lineLabel'),
+            json_extract(entry.value, '$.remark'),
+            json_extract(entry.value, '$.createdAt'),
+            json_extract(entry.value, '$.updatedAt')
+          FROM json_each(?) AS entry
+          WHERE 1
           ON CONFLICT(ip) DO UPDATE SET
             ip_type = excluded.ip_type,
             source_kind = excluded.source_kind,
             source_label = excluded.source_label,
             line_label = CASE WHEN COALESCE(excluded.line_label, '') != '' THEN excluded.line_label ELSE ${kernel.DNS_IP_POOL_ITEMS_TABLE}.line_label END,
             remark = CASE WHEN COALESCE(excluded.remark, '') != '' THEN excluded.remark ELSE ${kernel.DNS_IP_POOL_ITEMS_TABLE}.remark END,
-            updated_at = excluded.updated_at`).bind(item.id, item.ip, item.ipType, item.sourceKind, item.sourceLabel, item.lineLabel, item.remark, item.createdAt, item.updatedAt));
-			await db.batch(statements);
+            updated_at = excluded.updated_at`).bind(payload);
+			await db.batch([statement]);
 			return normalizedItems;
 		},
 		async deleteDnsIpPoolItems(db, ips = []) {
@@ -21102,14 +21016,17 @@ function defineAnalyticsDnsMethods(dependencies = {}, kernel = {}) {
 			await kernel.ensureDnsIpWorkspaceSchema(db);
 			const normalizedIps = [...new Set((Array.isArray(ips) ? ips : []).map((item) => String(item || "").trim()).filter((ip) => detectIpType(ip)))];
 			if (!normalizedIps.length) return 0;
-			const statements = normalizedIps.flatMap((ip) => [db.prepare(`DELETE FROM ${kernel.DNS_IP_POOL_ITEMS_TABLE} WHERE ip = ?`).bind(ip), db.prepare(`DELETE FROM ${kernel.DNS_IP_PROBE_CACHE_TABLE} WHERE ip = ?`).bind(ip)]);
-			const batchSize = 50;
-			for (let index = 0; index < statements.length; index += batchSize) await db.batch(statements.slice(index, index + batchSize));
+			const payload = JSON.stringify(normalizedIps);
+			assertD1SerializedValueFits("dns_ip_pool_items.delete_batch", payload);
+			await db.batch([
+				db.prepare(`DELETE FROM ${kernel.DNS_IP_POOL_ITEMS_TABLE} WHERE ip IN (SELECT value FROM json_each(?))`).bind(payload),
+				db.prepare(`DELETE FROM ${kernel.DNS_IP_PROBE_CACHE_TABLE} WHERE ip IN (SELECT value FROM json_each(?))`).bind(payload)
+			]);
 			return normalizedIps.length;
 		},
-		async getDnsIpPoolSourcesFromDb(db) {
+		async getDnsIpPoolSourcesFromDb(db, options = {}) {
 			if (!db) return [];
-			await kernel.ensureDnsIpWorkspaceSchema(db);
+			if (options.schemaReady !== true) await kernel.ensureDnsIpWorkspaceSchema(db);
 			try {
 				const result = await db.prepare(`SELECT id, name, url, source_type, domain, source_kind, preset_id, builtin_id, enabled, sort_order, ip_limit, last_fetch_at, last_fetch_status, last_fetch_count, created_at, updated_at
               FROM ${kernel.DNS_IP_POOL_SOURCES_TABLE}
@@ -21141,9 +21058,47 @@ function defineAnalyticsDnsMethods(dependencies = {}, kernel = {}) {
 			if (!db) throw new Error("D1 not configured");
 			await kernel.ensureDnsIpWorkspaceSchema(db);
 			const statements = [db.prepare(`DELETE FROM ${kernel.DNS_IP_POOL_SOURCES_TABLE}`)];
-			statements.push(...normalizedSources.map((source) => db.prepare(`INSERT INTO ${kernel.DNS_IP_POOL_SOURCES_TABLE} (
+			if (normalizedSources.length) {
+				const payload = JSON.stringify(normalizedSources.map((source) => ({
+					id: source.id,
+					name: source.name,
+					url: source.url,
+					sourceType: source.sourceType,
+					domain: source.domain,
+					sourceKind: source.sourceKind,
+					presetId: source.presetId,
+					builtinId: source.builtinId,
+					enabled: source.enabled ? 1 : 0,
+					sortOrder: source.sortOrder,
+					ipLimit: source.ipLimit,
+					lastFetchAt: source.lastFetchAt,
+					lastFetchStatus: source.lastFetchStatus,
+					lastFetchCount: source.lastFetchCount,
+					createdAt: source.createdAt,
+					updatedAt: source.updatedAt
+				})));
+				assertD1SerializedValueFits("dns_ip_pool_sources.batch", payload);
+				statements.push(db.prepare(`INSERT INTO ${kernel.DNS_IP_POOL_SOURCES_TABLE} (
             id, name, url, source_type, domain, source_kind, preset_id, builtin_id, enabled, sort_order, ip_limit, last_fetch_at, last_fetch_status, last_fetch_count, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(source.id, source.name, source.url, source.sourceType, source.domain, source.sourceKind, source.presetId, source.builtinId, source.enabled ? 1 : 0, source.sortOrder, source.ipLimit, source.lastFetchAt, source.lastFetchStatus, source.lastFetchCount, source.createdAt, source.updatedAt)));
+          ) SELECT
+            json_extract(entry.value, '$.id'),
+            json_extract(entry.value, '$.name'),
+            json_extract(entry.value, '$.url'),
+            json_extract(entry.value, '$.sourceType'),
+            json_extract(entry.value, '$.domain'),
+            json_extract(entry.value, '$.sourceKind'),
+            json_extract(entry.value, '$.presetId'),
+            json_extract(entry.value, '$.builtinId'),
+            json_extract(entry.value, '$.enabled'),
+            json_extract(entry.value, '$.sortOrder'),
+            json_extract(entry.value, '$.ipLimit'),
+            json_extract(entry.value, '$.lastFetchAt'),
+            json_extract(entry.value, '$.lastFetchStatus'),
+            json_extract(entry.value, '$.lastFetchCount'),
+            json_extract(entry.value, '$.createdAt'),
+            json_extract(entry.value, '$.updatedAt')
+          FROM json_each(?) AS entry`).bind(payload));
+			}
 			await db.batch(statements);
 			return normalizedSources;
 		},
@@ -21197,6 +21152,9 @@ function defineAnalyticsDnsMethods(dependencies = {}, kernel = {}) {
 			const updatedAt = String(entry?.updatedAt || entry?.updated_at || new Date(cachedAtMs).toISOString());
 			const importedCount = Math.max(0, Number(entry?.importedCount ?? entry?.imported_count) || items.length);
 			const enabledSourceCount = Math.max(0, Number(entry?.enabledSourceCount ?? entry?.enabled_source_count) || 0);
+			const itemsJson = JSON.stringify(items);
+			const sourceResultsJson = JSON.stringify(sourceResults);
+			if (getUtf8ByteLength(itemsJson) + getUtf8ByteLength(sourceResultsJson) > D1_SAFE_SERIALIZED_VALUE_MAX_BYTES) return null;
 			await db.prepare(`INSERT INTO ${kernel.DNS_IP_POOL_FETCH_CACHE_TABLE} (
             signature, items_json, source_results_json, imported_count, enabled_source_count, cached_at, expires_at, created_at, updated_at
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -21207,7 +21165,7 @@ function defineAnalyticsDnsMethods(dependencies = {}, kernel = {}) {
             enabled_source_count = excluded.enabled_source_count,
             cached_at = excluded.cached_at,
             expires_at = excluded.expires_at,
-            updated_at = excluded.updated_at`).bind(signature, JSON.stringify(items), JSON.stringify(sourceResults), importedCount, enabledSourceCount, cachedAtMs, expiresAtMs, createdAt, updatedAt).run();
+				updated_at = excluded.updated_at`).bind(signature, itemsJson, sourceResultsJson, importedCount, enabledSourceCount, cachedAtMs, expiresAtMs, createdAt, updatedAt).run();
 			return {
 				signature,
 				items,
@@ -21280,19 +21238,42 @@ function defineAnalyticsDnsMethods(dependencies = {}, kernel = {}) {
 				expiresAt: Math.max(0, Number(row?.expires_at) || 0)
 			}));
 		},
-		async upsertDnsIpProbeCacheEntry(db, entry = {}) {
-			if (!db) return null;
+		async upsertDnsIpProbeCacheEntries(db, entries = []) {
+			if (!db) return [];
 			await kernel.ensureDnsIpWorkspaceSchema(db);
-			const ip = String(entry?.ip || "").trim();
-			const entryColo = String(entry?.entryColo || entry?.entry_colo || "").trim().toUpperCase();
-			const probeStatus = normalizeDnsIpProbeStatus(entry?.probeStatus || entry?.probe_status || "");
-			if (!ip || !entryColo) return null;
-			const expiresAt = Math.max(nowMs(), Number(entry?.expiresAt ?? entry?.expires_at) || 0);
-			const probedAt = String(entry?.probedAt || entry?.probed_at || (/* @__PURE__ */ new Date()).toISOString());
+			const normalizedEntries = (Array.isArray(entries) ? entries : []).map((entry) => ({
+				ip: String(entry?.ip || "").trim(),
+				entryColo: String(entry?.entryColo || entry?.entry_colo || "").trim().toUpperCase(),
+				probeStatus: normalizeDnsIpProbeStatus(entry?.probeStatus || entry?.probe_status || ""),
+				latencyMs: Number.isFinite(Number(entry?.latencyMs ?? entry?.latency_ms)) ? Math.round(Number(entry?.latencyMs ?? entry?.latency_ms)) : null,
+				cfRay: String(entry?.cfRay || entry?.cf_ray || ""),
+				coloCode: String(entry?.coloCode || entry?.colo_code || "").toUpperCase(),
+				cityName: String(entry?.cityName || entry?.city_name || ""),
+				countryCode: String(entry?.countryCode || entry?.country_code || "").toUpperCase(),
+				countryName: String(entry?.countryName || entry?.country_name || ""),
+				probedAt: String(entry?.probedAt || entry?.probed_at || (/* @__PURE__ */ new Date()).toISOString()),
+				expiresAt: Math.max(nowMs(), Number(entry?.expiresAt ?? entry?.expires_at) || 0)
+			})).filter((entry) => detectIpType(entry.ip) && entry.entryColo);
+			if (!normalizedEntries.length) return [];
+			const payload = JSON.stringify(normalizedEntries);
+			if (getUtf8ByteLength(payload) > D1_SAFE_SERIALIZED_VALUE_MAX_BYTES) return [];
 			await db.prepare(`INSERT INTO ${kernel.DNS_IP_PROBE_CACHE_TABLE} (
-            ip, entry_colo, probe_status, latency_ms, cf_ray, colo_code, city_name, country_code, country_name, probed_at, expires_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(ip, entry_colo) DO UPDATE SET
+				ip, entry_colo, probe_status, latency_ms, cf_ray, colo_code, city_name, country_code, country_name, probed_at, expires_at
+			) SELECT
+				json_extract(entry.value, '$.ip'),
+				json_extract(entry.value, '$.entryColo'),
+				json_extract(entry.value, '$.probeStatus'),
+				json_extract(entry.value, '$.latencyMs'),
+				json_extract(entry.value, '$.cfRay'),
+				json_extract(entry.value, '$.coloCode'),
+				json_extract(entry.value, '$.cityName'),
+				json_extract(entry.value, '$.countryCode'),
+				json_extract(entry.value, '$.countryName'),
+				json_extract(entry.value, '$.probedAt'),
+				json_extract(entry.value, '$.expiresAt')
+			FROM json_each(?) AS entry
+			WHERE 1
+			ON CONFLICT(ip, entry_colo) DO UPDATE SET
             probe_status = excluded.probe_status,
             latency_ms = excluded.latency_ms,
             cf_ray = excluded.cf_ray,
@@ -21301,20 +21282,12 @@ function defineAnalyticsDnsMethods(dependencies = {}, kernel = {}) {
             country_code = excluded.country_code,
             country_name = excluded.country_name,
             probed_at = excluded.probed_at,
-            expires_at = excluded.expires_at`).bind(ip, entryColo, probeStatus, Number.isFinite(Number(entry?.latencyMs ?? entry?.latency_ms)) ? Math.round(Number(entry?.latencyMs ?? entry?.latency_ms)) : null, String(entry?.cfRay || entry?.cf_ray || ""), String(entry?.coloCode || entry?.colo_code || "").toUpperCase(), String(entry?.cityName || entry?.city_name || ""), String(entry?.countryCode || entry?.country_code || "").toUpperCase(), String(entry?.countryName || entry?.country_name || ""), probedAt, expiresAt).run();
-			return {
-				ip,
-				entryColo,
-				probeStatus,
-				latencyMs: Number.isFinite(Number(entry?.latencyMs ?? entry?.latency_ms)) ? Math.round(Number(entry?.latencyMs ?? entry?.latency_ms)) : null,
-				cfRay: String(entry?.cfRay || entry?.cf_ray || ""),
-				coloCode: String(entry?.coloCode || entry?.colo_code || "").toUpperCase(),
-				cityName: String(entry?.cityName || entry?.city_name || ""),
-				countryCode: String(entry?.countryCode || entry?.country_code || "").toUpperCase(),
-				countryName: String(entry?.countryName || entry?.country_name || ""),
-				probedAt,
-				expiresAt
-			};
+				expires_at = excluded.expires_at`).bind(payload).run();
+			return normalizedEntries;
+		},
+		async upsertDnsIpProbeCacheEntry(db, entry = {}) {
+			const entries = await kernel.upsertDnsIpProbeCacheEntries(db, [entry]);
+			return entries[0] || null;
 		}
 	};
 }
@@ -21621,6 +21594,7 @@ function defineAnalyticsCacheMethods(dependencies = {}, kernel = {}) {
 			const expiresAt = Math.max(cachedAt, Number(entry?.expiresAt) || cachedAt);
 			const updatedAt = Math.max(cachedAt, Number(entry?.updatedAt) || cachedAt);
 			const payloadText = JSON.stringify(sanitizeDashboardSnapshotPayload(entry?.payload || {}));
+			if (getUtf8ByteLength(payloadText) > D1_SAFE_SERIALIZED_VALUE_MAX_BYTES) return null;
 			await db.prepare(`INSERT INTO ${kernel.CF_DASH_CACHE_TABLE} (
             cache_key, zone_id, bucket_date, payload, version, cached_at, expires_at, updated_at
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -21750,6 +21724,7 @@ function defineAnalyticsCacheMethods(dependencies = {}, kernel = {}) {
 			const expiresAt = Math.max(cachedAt, Number(entry?.expiresAt) || cachedAt);
 			const updatedAt = Math.max(cachedAt, Number(entry?.updatedAt) || cachedAt);
 			const payloadText = JSON.stringify(entry?.payload ?? {});
+			if (getUtf8ByteLength(payloadText) > D1_SAFE_SERIALIZED_VALUE_MAX_BYTES) return null;
 			await db.prepare(`INSERT INTO ${kernel.CF_RUNTIME_CACHE_TABLE} (
             cache_key, cache_group, resource_id, payload, cached_at, expires_at, updated_at
           ) VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -22729,6 +22704,139 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 		getDB(env) {
 			return getD1Binding(env);
 		},
+		buildD1CreateTableSql(tableName, targetTableName = tableName, options = {}) {
+			const target = quoteSqlIdentifier(targetTableName);
+			const createTable = `CREATE TABLE${options.ifNotExists === true ? " IF NOT EXISTS" : ""}`;
+			const definitions = {
+				[kernel.D1_SCHEMA_META_TABLE]: `${createTable} ${target} (scope TEXT PRIMARY KEY, contract_version INTEGER NOT NULL, contract_hash TEXT NOT NULL, schema_fingerprint TEXT NOT NULL, schema_cookie INTEGER NOT NULL, last_plan_hash TEXT NOT NULL, verified_at TEXT NOT NULL, attestation TEXT NOT NULL, migration_owner TEXT, lease_expires_at INTEGER)`,
+				[kernel.SYS_STATUS_TABLE]: `${createTable} ${target} (scope TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at INTEGER NOT NULL)`,
+				[kernel.SCHEDULED_LOCKS_TABLE]: `${createTable} ${target} (scope TEXT PRIMARY KEY, token TEXT NOT NULL, owner TEXT NOT NULL, acquired_at INTEGER NOT NULL, renewed_at INTEGER, expires_at INTEGER NOT NULL)`,
+				[kernel.AUTH_FAILURES_TABLE]: `${createTable} ${target} (ip TEXT PRIMARY KEY, fail_count INTEGER NOT NULL, expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+				[kernel.CF_DASH_CACHE_TABLE]: `${createTable} ${target} (cache_key TEXT PRIMARY KEY, zone_id TEXT NOT NULL, bucket_date TEXT NOT NULL, payload TEXT NOT NULL, version INTEGER NOT NULL, cached_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+				[kernel.CF_RUNTIME_CACHE_TABLE]: `${createTable} ${target} (cache_key TEXT PRIMARY KEY, cache_group TEXT NOT NULL, resource_id TEXT NOT NULL, payload TEXT NOT NULL, cached_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+				[kernel.DNS_IP_POOL_ITEMS_TABLE]: `${createTable} ${target} (id TEXT PRIMARY KEY, ip TEXT NOT NULL UNIQUE, ip_type TEXT NOT NULL, source_kind TEXT NOT NULL, source_label TEXT, line_label TEXT NOT NULL DEFAULT '', remark TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+				[kernel.DNS_IP_POOL_SOURCES_TABLE]: `${createTable} ${target} (id TEXT PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL, source_type TEXT NOT NULL DEFAULT 'url', domain TEXT, source_kind TEXT NOT NULL DEFAULT 'custom', preset_id TEXT NOT NULL DEFAULT '', builtin_id TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, sort_order INTEGER NOT NULL DEFAULT 0, ip_limit INTEGER NOT NULL DEFAULT 5, last_fetch_at TEXT, last_fetch_status TEXT, last_fetch_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+				[kernel.DNS_IP_POOL_FETCH_CACHE_TABLE]: `${createTable} ${target} (signature TEXT PRIMARY KEY, items_json TEXT NOT NULL, source_results_json TEXT NOT NULL, imported_count INTEGER NOT NULL DEFAULT 0, enabled_source_count INTEGER NOT NULL DEFAULT 0, cached_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+				[kernel.DNS_IP_PROBE_CACHE_TABLE]: `${createTable} ${target} (ip TEXT NOT NULL, entry_colo TEXT NOT NULL, probe_status TEXT NOT NULL, latency_ms INTEGER, cf_ray TEXT, colo_code TEXT, city_name TEXT, country_code TEXT, country_name TEXT, probed_at TEXT NOT NULL, expires_at INTEGER NOT NULL, PRIMARY KEY (ip, entry_colo))`,
+				[kernel.LOGS_TABLE]: `${createTable} ${target} (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, node_name TEXT NOT NULL, request_path TEXT NOT NULL, request_method TEXT NOT NULL, status_code INTEGER NOT NULL, response_time INTEGER NOT NULL, client_ip TEXT NOT NULL, inbound_colo TEXT, outbound_colo TEXT, user_agent TEXT, referer TEXT, category TEXT DEFAULT 'api', error_detail TEXT, detail_json TEXT, created_at TEXT NOT NULL, inbound_ip TEXT, outbound_ip TEXT)`,
+				[kernel.STATS_HOURLY_TABLE]: `${createTable} ${target} (bucket_date TEXT NOT NULL, bucket_hour INTEGER NOT NULL, request_count INTEGER NOT NULL DEFAULT 0, play_count INTEGER NOT NULL DEFAULT 0, playback_info_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (bucket_date, bucket_hour))`
+			};
+			const sql = definitions[tableName];
+			if (!sql) throw new Error(`Unknown D1 schema table: ${tableName}`);
+			return sql;
+		},
+		getD1LogsFtsContractSql() {
+			return {
+				createTable: `CREATE VIRTUAL TABLE ${kernel.LOGS_FTS_TABLE} USING fts5(node_name, request_path, user_agent, error_detail, detail_json, content='${kernel.LOGS_TABLE}', content_rowid='id', tokenize='unicode61')`,
+				createTrigger: `CREATE TRIGGER ${kernel.LOGS_FTS_INSERT_TRIGGER} AFTER INSERT ON ${kernel.LOGS_TABLE} BEGIN
+          INSERT INTO ${kernel.LOGS_FTS_TABLE}(rowid, node_name, request_path, user_agent, error_detail, detail_json)
+          VALUES (new.id, new.node_name, new.request_path, COALESCE(new.user_agent, ''), COALESCE(new.error_detail, ''), COALESCE(new.detail_json, ''));
+        END;`
+			};
+		},
+		getD1ContractHash() {
+			const contract = kernel.getD1CurrentSchemaContract();
+			const createTables = Object.keys(contract.columns).sort().map((tableName) => [tableName, kernel.buildD1CreateTableSql(tableName)]);
+			return hashStableText(serializeConfigValue({
+				version: D1_SCHEMA_CONTRACT_VERSION,
+				createTables,
+				columns: contract.columns,
+				columnAffinities: contract.columnAffinities,
+				primaryKeys: contract.primaryKeys,
+				indexes: contract.indexes,
+				uniqueIndexes: contract.uniqueIndexes,
+				fts: kernel.getD1LogsFtsContractSql(),
+				safeColumnAdditions: kernel.getD1RuntimeColumnAdditions()
+			}));
+		},
+		async getD1SchemaCookie(db) {
+			// D1 rejects PRAGMA schema_version with SQLITE_AUTH. Keep the legacy
+			// response field stable while schema changes are detected by fingerprint.
+			return 0;
+		},
+		buildD1SchemaAttestationPayload(meta = {}) {
+			return serializeConfigValue({
+				scope: "main",
+				contractVersion: Math.max(0, Number(meta.contractVersion ?? meta.contract_version) || 0),
+				contractHash: String((meta.contractHash ?? meta.contract_hash) || ""),
+				schemaFingerprint: String((meta.schemaFingerprint ?? meta.schema_fingerprint) || ""),
+				schemaCookie: Math.max(0, Number(meta.schemaCookie ?? meta.schema_cookie) || 0),
+				lastPlanHash: String((meta.lastPlanHash ?? meta.last_plan_hash) || ""),
+				verifiedAt: String((meta.verifiedAt ?? meta.verified_at) || "")
+			});
+		},
+		async signD1SchemaAttestation(env, meta = {}) {
+			const secret = String(env?.JWT_SECRET || "").trim();
+			if (!secret) return "";
+			return await signHmac(secret, kernel.buildD1SchemaAttestationPayload(meta));
+		},
+		async readD1SchemaMeta(db) {
+			try {
+				return await db.prepare(`SELECT scope, contract_version, contract_hash, schema_fingerprint, schema_cookie, last_plan_hash, verified_at, attestation, migration_owner, lease_expires_at FROM ${quoteSqlIdentifier(kernel.D1_SCHEMA_META_TABLE)} WHERE scope = 'main' LIMIT 1`).first();
+			} catch {
+				return null;
+			}
+		},
+		async verifyD1SchemaAttestation(db, env) {
+			const meta = await kernel.readD1SchemaMeta(db);
+			if (!meta) return { valid: false, reason: "missing_meta" };
+			const currentVersion = Math.max(0, Number(meta.contract_version) || 0);
+			if (currentVersion > D1_SCHEMA_CONTRACT_VERSION) return { valid: false, blocked: true, reason: "schema_version_ahead", meta };
+			if (currentVersion !== D1_SCHEMA_CONTRACT_VERSION) return { valid: false, reason: "version_mismatch", meta };
+			if (String(meta.contract_hash || "") !== kernel.getD1ContractHash()) return { valid: false, reason: "contract_hash_mismatch", meta };
+			const schemaCookie = await kernel.getD1SchemaCookie(db);
+			if (Math.max(0, Number(meta.schema_cookie) || 0) !== schemaCookie) return { valid: false, reason: "schema_cookie_changed", meta, schemaCookie };
+			const schemaFingerprint = await kernel.getD1SchemaFingerprint(db);
+			if (String(meta.schema_fingerprint || "") !== schemaFingerprint) return { valid: false, reason: "schema_fingerprint_changed", meta, schemaCookie, schemaFingerprint };
+			const expected = await kernel.signD1SchemaAttestation(env, meta);
+			if (!expected || expected !== String(meta.attestation || "")) return { valid: false, reason: "invalid_attestation", meta, schemaCookie };
+			return { valid: true, meta, schemaCookie, schemaFingerprint };
+		},
+		async writeVerifiedD1SchemaMeta(db, env, plan = {}) {
+			const contractHash = kernel.getD1ContractHash();
+			const schemaFingerprint = String(plan?.schemaFingerprint || "") || await kernel.getD1SchemaFingerprint(db);
+			const schemaCookie = await kernel.getD1SchemaCookie(db);
+			const verifiedAt = (/* @__PURE__ */ new Date()).toISOString();
+			const values = {
+				contractVersion: D1_SCHEMA_CONTRACT_VERSION,
+				contractHash,
+				schemaFingerprint,
+				schemaCookie,
+				lastPlanHash: String(plan?.planHash || ""),
+				verifiedAt
+			};
+			const attestation = await kernel.signD1SchemaAttestation(env, values);
+			if (!attestation) return { written: false, reason: "missing_secret", ...values };
+			await db.prepare(`INSERT INTO ${quoteSqlIdentifier(kernel.D1_SCHEMA_META_TABLE)} (scope, contract_version, contract_hash, schema_fingerprint, schema_cookie, last_plan_hash, verified_at, attestation, migration_owner, lease_expires_at)
+        VALUES ('main', ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+        ON CONFLICT(scope) DO UPDATE SET contract_version = excluded.contract_version, contract_hash = excluded.contract_hash, schema_fingerprint = excluded.schema_fingerprint, schema_cookie = excluded.schema_cookie, last_plan_hash = excluded.last_plan_hash, verified_at = excluded.verified_at, attestation = excluded.attestation, migration_owner = NULL, lease_expires_at = NULL`).bind(D1_SCHEMA_CONTRACT_VERSION, contractHash, schemaFingerprint, schemaCookie, values.lastPlanHash, verifiedAt, attestation).run();
+			return { written: true, attestation, ...values };
+		},
+		async acquireD1SchemaRepairLease(db, owner, options = {}) {
+			const now = Math.max(0, Number(options.nowMs ?? nowMs()) || 0);
+			const leaseExpiresAt = now + D1_SCHEMA_REPAIR_LEASE_MS;
+			const result = await db.prepare(`INSERT INTO ${quoteSqlIdentifier(kernel.D1_SCHEMA_META_TABLE)} (scope, contract_version, contract_hash, schema_fingerprint, schema_cookie, last_plan_hash, verified_at, attestation, migration_owner, lease_expires_at)
+        VALUES ('main', 0, '', '', 0, '', '', '', ?, ?)
+        ON CONFLICT(scope) DO UPDATE SET migration_owner = excluded.migration_owner, lease_expires_at = excluded.lease_expires_at
+        WHERE ${quoteSqlIdentifier(kernel.D1_SCHEMA_META_TABLE)}.migration_owner IS NULL OR ${quoteSqlIdentifier(kernel.D1_SCHEMA_META_TABLE)}.lease_expires_at IS NULL OR ${quoteSqlIdentifier(kernel.D1_SCHEMA_META_TABLE)}.lease_expires_at < ? OR ${quoteSqlIdentifier(kernel.D1_SCHEMA_META_TABLE)}.migration_owner = excluded.migration_owner`).bind(owner, leaseExpiresAt, now).run();
+			const changes = Math.max(0, Number(result?.meta?.changes ?? result?.changes) || 0);
+			if (changes < 1) { const error = new Error("D1 schema repair is already running"); error.code = "D1_SCHEMA_REPAIR_IN_PROGRESS"; error.status = 409; error.details = { leaseExpiresAt }; throw error; }
+			return { owner, leaseExpiresAt };
+		},
+		async releaseD1SchemaRepairLease(db, owner) {
+			if (!owner) return false;
+			await db.prepare(`UPDATE ${quoteSqlIdentifier(kernel.D1_SCHEMA_META_TABLE)} SET migration_owner = NULL, lease_expires_at = NULL WHERE scope = 'main' AND migration_owner = ?`).bind(owner).run();
+			return true;
+		},
+		getD1UniqueIndexContract() {
+			return {
+				ux_dns_ip_pool_items_ip: {
+					table: kernel.DNS_IP_POOL_ITEMS_TABLE,
+					columns: ["ip"],
+					createSql: `CREATE UNIQUE INDEX ux_dns_ip_pool_items_ip ON ${kernel.DNS_IP_POOL_ITEMS_TABLE} (ip)`
+				}
+			};
+		},
 		getD1RuntimeIndexContract() {
 			return {
 				idx_sys_locks_expires_at: {
@@ -22804,6 +22912,17 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 		},
 		getD1RuntimeColumnAdditions() {
 			return {
+				[kernel.D1_SCHEMA_META_TABLE]: {
+					contract_version: "INTEGER NOT NULL DEFAULT 0",
+					contract_hash: "TEXT NOT NULL DEFAULT ''",
+					schema_fingerprint: "TEXT NOT NULL DEFAULT ''",
+					schema_cookie: "INTEGER NOT NULL DEFAULT 0",
+					last_plan_hash: "TEXT NOT NULL DEFAULT ''",
+					verified_at: "TEXT NOT NULL DEFAULT ''",
+					attestation: "TEXT NOT NULL DEFAULT ''",
+					migration_owner: "TEXT",
+					lease_expires_at: "INTEGER"
+				},
 				[kernel.SYS_STATUS_TABLE]: {
 					payload: "TEXT NOT NULL DEFAULT '{}'",
 					updated_at: "INTEGER NOT NULL DEFAULT 0"
@@ -22914,6 +23033,7 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 		},
 		getD1RequiredPrimaryKeyContract() {
 			return {
+				[kernel.D1_SCHEMA_META_TABLE]: ["scope"],
 				[kernel.SYS_STATUS_TABLE]: ["scope"],
 				[kernel.SCHEDULED_LOCKS_TABLE]: ["scope"],
 				[kernel.AUTH_FAILURES_TABLE]: ["ip"],
@@ -22999,16 +23119,6 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 			if (currentMeta.hash === nextMeta.hash && currentMeta.revision) return currentMeta;
 			return await kernel.writeRevisionMeta(kv, kernel.CONFIG_META_KEY, nextMeta, options.ctx);
 		},
-		async ensureConfigSnapshotsMeta(kv, snapshots = null, options = {}) {
-			const nextSnapshots = Array.isArray(snapshots) ? snapshots : await kernel.readStoredConfigSnapshots(kv);
-			const nextMeta = kernel.normalizeRevisionMeta({
-				...buildHashedMetaPayload(nextSnapshots),
-				count: nextSnapshots.length
-			}, { count: 0 });
-			const currentMeta = await kernel.readRevisionMeta(kv, kernel.CONFIG_SNAPSHOTS_META_KEY, { count: 0 });
-			if (currentMeta.hash === nextMeta.hash && Number(currentMeta.count) === Number(nextMeta.count) && currentMeta.revision) return currentMeta;
-			return await kernel.writeRevisionMeta(kv, kernel.CONFIG_SNAPSHOTS_META_KEY, nextMeta, options.ctx);
-		},
 		buildNodesIndexMeta(index = [], nodes = [], options = {}) {
 			const normalizedIndex = kernel.normalizeNodeIndex(index);
 			const normalizedNodes = kernel.normalizeNodeSummaryIndex(nodes).nodes;
@@ -23091,14 +23201,13 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 			const resolvedStores = kernel.resolveOpsStatusStores(stores);
 			const kv = resolvedStores.kv;
 			const db = resolvedStores.db;
-			const [configMeta, nodesMeta, snapshotsMeta, logStatus, dnsIpPoolStatus] = await Promise.all([
+			const [configMeta, nodesMeta, logStatus, dnsIpPoolStatus] = await Promise.all([
 				kernel.ensureConfigMeta(kv, options.config, { ctx: options.ctx }),
 				kernel.ensureNodesIndexMeta(kv, {
 					ctx: options.ctx,
 					index: options.nodes?.map?.((node) => node?.name),
 					nodes: options.nodes
 				}),
-				kernel.ensureConfigSnapshotsMeta(kv, options.snapshots, { ctx: options.ctx }),
 				kernel.getOpsStatusSection({
 					kv,
 					db
@@ -23111,7 +23220,6 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 			return {
 				configRevision: String(configMeta?.revision || ""),
 				nodesRevision: String(nodesMeta?.revision || ""),
-				snapshotsRevision: String(snapshotsMeta?.revision || ""),
 				logsRevision: kernel.getLogsRevisionFromStatus(logStatus),
 				dnsIpPoolRevision: kernel.getDnsIpPoolRevisionFromStatus(dnsIpPoolStatus)
 			};
@@ -23120,14 +23228,13 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 			const resolvedStores = kernel.resolveOpsStatusStores(stores);
 			const kv = resolvedStores.kv;
 			const db = resolvedStores.db;
-			const [storedConfigMeta, storedNodesMeta, storedSnapshotsMeta, logStatus, dnsIpPoolStatus] = await Promise.all([
+			const [storedConfigMeta, storedNodesMeta, logStatus, dnsIpPoolStatus] = await Promise.all([
 				kernel.readRevisionMetaForRead(kv, kernel.CONFIG_META_KEY),
 				kernel.readRevisionMetaForRead(kv, kernel.NODES_INDEX_META_KEY, {
 					count: 0,
 					indexHash: "",
 					fullIndexHash: ""
 				}),
-				kernel.readRevisionMetaForRead(kv, kernel.CONFIG_SNAPSHOTS_META_KEY, { count: 0 }),
 				kernel.getOpsStatusSection({
 					kv,
 					db
@@ -23137,28 +23244,20 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 					db
 				}, "dnsIpPool")
 			]);
-			let configMeta = storedConfigMeta;
-			if (!configMeta) {
-				const sourceConfig = options.config !== void 0 ? options.config : await kvGetStrict(kv, kernel.CONFIG_KEY, { type: "json" }) || {};
-				configMeta = kernel.normalizeRevisionMeta(buildHashedMetaPayload(sanitizeRuntimeConfig(sourceConfig)));
-			}
+			const sourceConfig = options.config !== void 0 ? options.config : await kvGetStrict(kv, kernel.CONFIG_KEY, { type: "json" }) || {};
+			const derivedConfigMeta = kernel.normalizeRevisionMeta(buildHashedMetaPayload(sanitizeRuntimeConfig(sourceConfig), {
+				updatedAt: String(storedConfigMeta?.updatedAt || "").trim()
+			}));
+			const storedConfigRevisionHash = String(storedConfigMeta?.revision || "").trim().split(".").pop() || "";
+			const configMeta = storedConfigMeta?.hash === derivedConfigMeta.hash && storedConfigRevisionHash === derivedConfigMeta.hash ? storedConfigMeta : derivedConfigMeta;
 			let nodesMeta = storedNodesMeta;
 			if (!nodesMeta) {
 				const nodes = Array.isArray(options.nodes) ? options.nodes : await kernel.getNodesSummaryIndexStrict(kv, { ctx: options.ctx });
 				nodesMeta = kernel.buildNodesIndexMeta((Array.isArray(nodes) ? nodes : []).map((node) => node?.name), Array.isArray(nodes) ? nodes : []);
 			}
-			let snapshotsMeta = storedSnapshotsMeta;
-			if (!snapshotsMeta) {
-				const snapshots = Array.isArray(options.snapshots) ? options.snapshots : await kernel.readStoredConfigSnapshotsStrict(kv);
-				snapshotsMeta = kernel.normalizeRevisionMeta({
-					...buildHashedMetaPayload(Array.isArray(snapshots) ? snapshots : []),
-					count: Array.isArray(snapshots) ? snapshots.length : 0
-				}, { count: 0 });
-			}
 			return {
 				configRevision: String(configMeta?.revision || ""),
 				nodesRevision: String(nodesMeta?.revision || ""),
-				snapshotsRevision: String(snapshotsMeta?.revision || ""),
 				logsRevision: kernel.getLogsRevisionFromStatus(logStatus),
 				dnsIpPoolRevision: kernel.getDnsIpPoolRevisionFromStatus(dnsIpPoolStatus)
 			};
@@ -23245,10 +23344,14 @@ function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 		async getTableColumnDefinitions(db, tableName) {
 			if (!db || !tableName) return [];
 			try {
-				return ((await db.prepare(`PRAGMA table_info(${quoteSqlIdentifier(tableName)})`).all())?.results || []).map((row) => ({
+				return ((await db.prepare(`PRAGMA table_xinfo(${quoteSqlIdentifier(tableName)})`).all())?.results || []).map((row) => ({
 					name: String(row?.name || "").toLowerCase(),
 					type: String(row?.type || "").trim().toUpperCase(),
-					primaryKeyOrder: Math.max(0, Number(row?.pk) || 0)
+					affinity: normalizeSqliteTypeAffinity(row?.type),
+					primaryKeyOrder: Math.max(0, Number(row?.pk) || 0),
+					notNull: Number(row?.notnull) === 1,
+					defaultValue: row?.dflt_value ?? null,
+					hidden: Math.max(0, Number(row?.hidden) || 0)
 				})).filter((column) => column.name);
 			} catch (cause) {
 				const error = /* @__PURE__ */ new Error(`D1 schema inspection failed for ${tableName}`);
@@ -23309,9 +23412,38 @@ function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 			const rows = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all();
 			return new Set((rows?.results || []).map((row) => String(row?.name || "")).filter(Boolean));
 		},
+		async getD1SchemaSnapshot(db) {
+			if (!db) return { objects: [], columns: [], indexes: [] };
+			const contractTables = Object.keys(kernel.getD1CurrentSchemaContract().columns);
+			const inspectedTables = [...contractTables, kernel.LOGS_FTS_TABLE];
+			const placeholders = inspectedTables.map(() => "?").join(", ");
+			const indexPlaceholders = contractTables.map(() => "?").join(", ");
+			const [objects, columns, indexes] = await Promise.all([
+				db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type IN ('table', 'index', 'trigger') ORDER BY type, name").all(),
+				db.prepare(`SELECT schema_table.name AS table_name, column_info.name, column_info.type, column_info."notnull" AS is_not_null,
+					column_info.dflt_value, column_info.pk, column_info.hidden
+					FROM sqlite_master AS schema_table
+					JOIN pragma_table_xinfo(schema_table.name) AS column_info
+					WHERE schema_table.type = 'table' AND schema_table.name IN (${placeholders})
+					ORDER BY schema_table.name, column_info.cid`).bind(...inspectedTables).all(),
+				db.prepare(`SELECT schema_index.tbl_name AS table_name, index_list.name AS index_name, index_list."unique" AS is_unique,
+					index_list.partial, index_list.origin, index_column.seqno, index_column.cid, index_column.name AS column_name, index_column."key" AS is_key
+					FROM sqlite_master AS schema_index
+					JOIN pragma_index_list(schema_index.tbl_name) AS index_list ON index_list.name = schema_index.name
+					JOIN pragma_index_xinfo(index_list.name) AS index_column
+					WHERE schema_index.type = 'index' AND schema_index.tbl_name IN (${indexPlaceholders})
+					ORDER BY schema_index.tbl_name, index_list.name, index_column.seqno`).bind(...contractTables).all()
+			]);
+			return {
+				objects: objects?.results || [],
+				columns: columns?.results || [],
+				indexes: indexes?.results || []
+			};
+		},
 		getD1CurrentSchemaContract() {
 			const primaryKeys = kernel.getD1RequiredPrimaryKeyContract();
 			const primaryKeyTypes = {
+				[kernel.D1_SCHEMA_META_TABLE]: { scope: "TEXT" },
 				[kernel.SYS_STATUS_TABLE]: { scope: "TEXT" },
 				[kernel.SCHEDULED_LOCKS_TABLE]: { scope: "TEXT" },
 				[kernel.AUTH_FAILURES_TABLE]: { ip: "TEXT" },
@@ -23332,17 +23464,53 @@ function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 				return [tableName, { ...primaryKeyTypes[tableName], ...runtimeTypes }];
 			}));
 			const columns = Object.fromEntries(Object.entries(columnTypes).map(([tableName, definitions]) => [tableName, Object.keys(definitions)]));
-			return { columns, columnTypes, primaryKeys, indexes: kernel.getD1RuntimeIndexContract() };
+			const columnAffinities = Object.fromEntries(Object.entries(columnTypes).map(([tableName, definitions]) => [tableName, Object.fromEntries(Object.entries(definitions).map(([name, type]) => [name, normalizeSqliteTypeAffinity(type)]))]));
+			return {
+				columns,
+				columnTypes,
+				columnAffinities,
+				primaryKeys,
+				indexes: kernel.getD1RuntimeIndexContract(),
+				uniqueIndexes: kernel.getD1UniqueIndexContract()
+			};
 		},
-		async getD1SchemaStatus(db) {
+		async getD1SchemaFingerprint(db) {
+			if (!db) return "";
+			const schemaRows = (await db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type IN ('table', 'index', 'trigger') ORDER BY type, name").all())?.results || [];
+			return hashStableText(serializeConfigValue(schemaRows));
+		},
+		async getD1SchemaStatus(db, options = {}) {
 			if (!db) return { tables: {}, columns: {}, indexes: {}, constraints: { primaryKeys: {}, uniqueKeys: {} }, ftsReady: false, fts: {}, schemaReady: false, issues: ["db_not_configured"] };
 			const contract = kernel.getD1CurrentSchemaContract();
-			const [tableRows, indexRows] = await Promise.all([
-				db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all(),
-				db.prepare("SELECT name, tbl_name FROM sqlite_master WHERE type = 'index'").all()
-			]);
-			const tableNames = new Set((tableRows?.results || []).map((row) => String(row?.name || "")).filter(Boolean));
-			const indexOwners = new Map((indexRows?.results || []).map((row) => [String(row?.name || ""), String(row?.tbl_name || "")]).filter(([name]) => name));
+			const snapshot = options.snapshot || await kernel.getD1SchemaSnapshot(db);
+			const objectRows = snapshot.objects || [];
+			const tableNames = new Set(objectRows.filter((row) => row?.type === "table").map((row) => String(row?.name || "")).filter(Boolean));
+			const indexRowsByName = new Map();
+			for (const row of snapshot.indexes || []) {
+				const indexName = String(row?.index_name || "");
+				if (!indexName) continue;
+				let entry = indexRowsByName.get(indexName);
+				if (!entry) {
+					entry = { name: indexName, table: String(row?.table_name || ""), unique: Number(row?.is_unique) === 1, partial: Number(row?.partial) === 1, origin: String(row?.origin || ""), columns: [] };
+					indexRowsByName.set(indexName, entry);
+				}
+				if (row?.is_key === void 0 || Number(row.is_key) === 1) entry.columns.push({ order: Math.max(0, Number(row?.seqno) || 0), name: Number(row?.cid) === -2 || !String(row?.column_name || "").trim() ? "<expression>" : String(row.column_name).toLowerCase() });
+			}
+			for (const entry of indexRowsByName.values()) entry.columns = entry.columns.sort((left, right) => left.order - right.order).map((column) => column.name);
+			const columnRowsByTable = new Map();
+			for (const row of snapshot.columns || []) {
+				const tableName = String(row?.table_name || "");
+				if (!columnRowsByTable.has(tableName)) columnRowsByTable.set(tableName, []);
+				columnRowsByTable.get(tableName).push({
+					name: String(row?.name || "").toLowerCase(),
+					type: String(row?.type || "").trim().toUpperCase(),
+					affinity: normalizeSqliteTypeAffinity(row?.type),
+					primaryKeyOrder: Math.max(0, Number(row?.pk) || 0),
+					notNull: Number(row?.is_not_null) === 1,
+					defaultValue: row?.dflt_value ?? null,
+					hidden: Math.max(0, Number(row?.hidden) || 0)
+				});
+			}
 			const tables = Object.fromEntries(Object.keys(contract.columns).map((name) => [name, tableNames.has(name)]));
 			const columns = {};
 			const primaryKeys = {};
@@ -23354,40 +23522,65 @@ function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 					issues.push(`missing_table:${tableName}`);
 					continue;
 				}
-				const definitions = await kernel.getTableColumnDefinitions(db, tableName);
+				const definitions = columnRowsByTable.get(tableName) || [];
 				const actualColumns = new Map(definitions.map((column) => [column.name, column]));
 				columns[tableName] = Object.fromEntries(requiredColumns.map((name) => {
 					const actual = actualColumns.get(name);
-					const expectedType = String(contract.columnTypes?.[tableName]?.[name] || "").toUpperCase();
-					return [name, !!actual && (!expectedType || actual.type === expectedType)];
+					const expectedAffinity = String(contract.columnAffinities?.[tableName]?.[name] || "").toUpperCase();
+					const exactIntegerRowId = tableName === kernel.LOGS_TABLE && name === "id";
+					return [name, !!actual && (!expectedAffinity || actual.affinity === expectedAffinity) && (!exactIntegerRowId || actual.type === "INTEGER")];
 				}));
 				for (const [name, ready] of Object.entries(columns[tableName])) if (!ready) {
 					const actual = actualColumns.get(name);
-					issues.push(actual ? `invalid_column_type:${tableName}.${name}` : `missing_column:${tableName}.${name}`);
+					issues.push(actual ? `invalid_column_affinity:${tableName}.${name}` : `missing_column:${tableName}.${name}`);
 				}
 				const actualPrimaryKey = definitions.filter((column) => column.primaryKeyOrder > 0).sort((left, right) => left.primaryKeyOrder - right.primaryKeyOrder).map((column) => column.name);
 				const idColumn = tableName === kernel.LOGS_TABLE ? definitions.find((column) => column.name === "id") : null;
 				primaryKeys[tableName] = serializeConfigValue(actualPrimaryKey) === serializeConfigValue(contract.primaryKeys[tableName] || []) && (!idColumn || idColumn.type === "INTEGER");
 				if (!primaryKeys[tableName]) issues.push(`invalid_primary_key:${tableName}`);
+				const unsupportedRequiredColumns = definitions.filter((column) => !requiredColumns.includes(column.name) && column.notNull && column.defaultValue === null && column.primaryKeyOrder === 0).map((column) => column.name);
+				if (unsupportedRequiredColumns.length) issues.push(`unsupported_required_columns:${tableName}:${unsupportedRequiredColumns.join(",")}`);
 			}
 			let dnsIpUniqueReady = false;
 			if (tableNames.has(kernel.DNS_IP_POOL_ITEMS_TABLE)) {
-				for (const index of (await kernel.getTableIndexDefinitions(db, kernel.DNS_IP_POOL_ITEMS_TABLE)).filter((item) => item.unique && !item.partial)) {
-					if (serializeConfigValue(await kernel.getIndexKeyColumns(db, index.name)) === serializeConfigValue(["ip"])) { dnsIpUniqueReady = true; break; }
+				for (const index of [...indexRowsByName.values()].filter((item) => item.table === kernel.DNS_IP_POOL_ITEMS_TABLE && item.unique && !item.partial)) {
+					if (serializeConfigValue(index.columns) === serializeConfigValue(["ip"])) { dnsIpUniqueReady = true; break; }
 				}
 				if (!dnsIpUniqueReady) issues.push(`missing_unique_key:${kernel.DNS_IP_POOL_ITEMS_TABLE}.ip`);
 			}
 			const indexes = {};
 			for (const [indexName, definition] of Object.entries(contract.indexes)) {
-				const owner = indexOwners.get(indexName);
-				if (!owner) { indexes[indexName] = false; issues.push(`missing_index:${indexName}`); continue; }
-				const listed = (await kernel.getTableIndexDefinitions(db, definition.table)).find((item) => item.name === indexName);
-				indexes[indexName] = owner === definition.table && listed?.unique === false && listed?.partial === false && serializeConfigValue(await kernel.getIndexKeyColumns(db, indexName)) === serializeConfigValue(definition.columns);
+				const listed = indexRowsByName.get(indexName);
+				if (!listed) { indexes[indexName] = false; issues.push(`missing_index:${indexName}`); continue; }
+				indexes[indexName] = listed.table === definition.table && listed.unique === false && listed.partial === false && serializeConfigValue(listed.columns) === serializeConfigValue(definition.columns);
 				if (!indexes[indexName]) issues.push(`invalid_index:${indexName}`);
 			}
-			const fts = await kernel.getLogsFtsReadiness(db);
+			for (const tableName of Object.keys(contract.columns)) {
+				const allowedUniqueKeys = [contract.primaryKeys?.[tableName] || [], ...Object.values(contract.uniqueIndexes || {}).filter((definition) => definition.table === tableName).map((definition) => definition.columns)];
+				const unsupportedUniqueIndexes = [...indexRowsByName.values()].filter((index) => index.table === tableName && index.unique && !index.partial && !allowedUniqueKeys.some((columns) => serializeConfigValue(columns) === serializeConfigValue(index.columns))).map((index) => index.name);
+				if (unsupportedUniqueIndexes.length) issues.push(`unsupported_unique_indexes:${tableName}:${unsupportedUniqueIndexes.join(",")}`);
+			}
+			const knownTriggerNames = new Set([String(kernel.LOGS_FTS_INSERT_TRIGGER).toLowerCase()]);
+			for (const tableName of Object.keys(contract.columns)) {
+				const unsupportedTriggers = objectRows.filter((row) => row?.type === "trigger" && String(row?.tbl_name || "") === tableName && !knownTriggerNames.has(String(row?.name || "").toLowerCase())).map((row) => String(row?.name || "")).filter(Boolean);
+				if (unsupportedTriggers.length) issues.push(`unsupported_triggers:${tableName}:${unsupportedTriggers.join(",")}`);
+			}
+			const ftsTable = objectRows.find((row) => row?.type === "table" && String(row?.name || "") === kernel.LOGS_FTS_TABLE);
+			const ftsTrigger = objectRows.find((row) => row?.type === "trigger" && String(row?.name || "") === kernel.LOGS_FTS_INSERT_TRIGGER);
+			const ftsColumns = new Set((columnRowsByTable.get(kernel.LOGS_FTS_TABLE) || []).map((column) => column.name));
+			const tableSql = normalizeSqlIdentifierSearchText(ftsTable?.sql || "").replace(/'/g, "");
+			const triggerSql = normalizeSqlIdentifierSearchText(ftsTrigger?.sql || "");
+			const compactTriggerSql = triggerSql.replace(/\s+/g, "");
+			const expectedTriggerInsert = `insertinto${kernel.LOGS_FTS_TABLE}(rowid,node_name,request_path,user_agent,error_detail,detail_json)values(new.id,new.node_name,new.request_path,coalesce(new.user_agent,''),coalesce(new.error_detail,''),coalesce(new.detail_json,''))`;
+			const fts = {
+				tableReady: !!ftsTable,
+				virtualTableReady: !!ftsTable && /^create\s+virtual\s+table\b/.test(tableSql) && /\busing\s+fts5\s*\(/.test(tableSql) && new RegExp(`\\bcontent\\s*=\\s*${kernel.LOGS_TABLE}\\b`).test(tableSql) && /\bcontent_rowid\s*=\s*id\b/.test(tableSql),
+				columnsReady: ["node_name", "request_path", "user_agent", "error_detail", "detail_json"].every((name) => ftsColumns.has(name)),
+				triggerReady: String(ftsTrigger?.tbl_name || "") === kernel.LOGS_TABLE && new RegExp(`\\bafter\\s+insert\\s+on\\s+${kernel.LOGS_TABLE}\\b`).test(triggerSql) && compactTriggerSql.includes(expectedTriggerInsert)
+			};
+			fts.ready = fts.virtualTableReady && fts.columnsReady && fts.triggerReady;
 			if (!fts.ready) issues.push(fts.tableReady ? "fts_contract_invalid" : `missing_table:${kernel.LOGS_FTS_TABLE}`);
-			const schemaReady = Object.values(tables).every(Boolean) && Object.values(columns).every((entry) => Object.values(entry).every(Boolean)) && Object.values(primaryKeys).every(Boolean) && dnsIpUniqueReady && Object.values(indexes).every(Boolean) && fts.ready;
+			const schemaReady = issues.length === 0 && Object.values(tables).every(Boolean) && Object.values(columns).every((entry) => Object.values(entry).every(Boolean)) && Object.values(primaryKeys).every(Boolean) && dnsIpUniqueReady && Object.values(indexes).every(Boolean) && fts.ready;
 			return {
 				tables,
 				columns,
@@ -23399,76 +23592,569 @@ function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 				issues
 			};
 		},
-		async assertD1CurrentSchema(db, status = null) {
-			const current = status || await kernel.getD1SchemaStatus(db);
+		async getD1SchemaReadiness(db, options = {}) {
+			if (options.allowAttestedFastPath === true && options.env) {
+				const attested = await kernel.verifyD1SchemaAttestation(db, options.env);
+				if (attested.blocked) return { schemaReady: false, fastPath: false, issues: ["schema_version_ahead"], attested };
+				if (attested.valid) return {
+					schemaReady: true,
+					fastPath: true,
+					contractVersion: D1_SCHEMA_CONTRACT_VERSION,
+					contractHash: kernel.getD1ContractHash(),
+					schemaFingerprint: String(attested.meta?.schema_fingerprint || ""),
+					schemaCookie: attested.schemaCookie,
+					issues: []
+				};
+			}
+			return { ...await kernel.getD1SchemaStatus(db), fastPath: false };
+		},
+		async probeD1UniqueKeyRepair(db, tableName, columns = []) {
+			const quotedTable = quoteSqlIdentifier(tableName);
+			const quotedColumns = columns.map((name) => quoteSqlIdentifier(name));
+			const emptyPredicate = quotedColumns.map((name) => `${name} IS NULL OR (typeof(${name}) = 'text' AND trim(${name}) = '')`).join(" OR ");
+			const [emptyRow, duplicateRow] = await Promise.all([
+				db.prepare(`SELECT 1 AS present FROM ${quotedTable} WHERE ${emptyPredicate} LIMIT 1`).first(),
+				db.prepare(`SELECT 1 AS present FROM ${quotedTable} GROUP BY ${quotedColumns.join(", ")} HAVING COUNT(*) > 1 LIMIT 1`).first()
+			]);
+			return { empty: !!emptyRow, duplicate: !!duplicateRow };
+		},
+		async probeD1PrimaryKeyRepair(db, tableName, contract) {
+			const definitions = await kernel.getTableColumnDefinitions(db, tableName);
+			const allowsDataLoss = tableName === kernel.LOGS_TABLE;
+			const expectedColumns = new Set(contract.columns?.[tableName] || []);
+			const expectedPrimaryKey = contract.primaryKeys?.[tableName] || [];
+			const actualColumns = new Map(definitions.map((column) => [column.name, column]));
+			const blockers = [];
+			for (const columnName of expectedPrimaryKey) {
+				const actual = actualColumns.get(columnName);
+				const expectedAffinity = contract.columnAffinities?.[tableName]?.[columnName];
+				if (!actual) { if (!allowsDataLoss) blockers.push(`missing_key_column:${tableName}.${columnName}`); }
+				else if (actual.affinity !== expectedAffinity || tableName === kernel.LOGS_TABLE && columnName === "id" && actual.type !== "INTEGER") blockers.push(`invalid_column_affinity:${tableName}.${columnName}`);
+			}
+			const extraColumns = definitions.filter((column) => !expectedColumns.has(column.name)).map((column) => column.name);
+			if (!allowsDataLoss && extraColumns.length) blockers.push(`unsupported_extra_columns:${tableName}:${extraColumns.join(",")}`);
+			if (!allowsDataLoss && definitions.some((column) => column.hidden > 0)) blockers.push(`unsupported_hidden_columns:${tableName}`);
+			const foreignKeys = (await db.prepare(`PRAGMA foreign_key_list(${quoteSqlIdentifier(tableName)})`).all())?.results || [];
+			if (foreignKeys.length) blockers.push(`unsupported_foreign_keys:${tableName}`);
+			const triggerRows = (await db.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?").bind(tableName).all())?.results || [];
+			const unknownTriggers = triggerRows.filter((row) => {
+				if (tableName !== kernel.LOGS_TABLE) return true;
+				const name = String(row?.name || "").toLowerCase();
+				const sql = normalizeSqlIdentifierSearchText(row?.sql || "");
+				return !(name === String(kernel.LOGS_FTS_INSERT_TRIGGER).toLowerCase() || name === `${kernel.LOGS_TABLE}_ai` || name === `${kernel.LOGS_TABLE}_au` || name === `${kernel.LOGS_TABLE}_ad` || sql.includes(String(kernel.LOGS_FTS_TABLE).toLowerCase()));
+			});
+			if (!allowsDataLoss && unknownTriggers.length) blockers.push(`unsupported_triggers:${tableName}:${unknownTriggers.map((row) => String(row?.name || "")).join(",")}`);
+			const artifactPrefixes = [`__d1_repair_${tableName}_`, `__d1_backup_${tableName}_`];
+			const artifactRow = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND (name GLOB ? OR name GLOB ?) LIMIT 1").bind(`${artifactPrefixes[0]}*`, `${artifactPrefixes[1]}*`).first();
+			if (artifactRow?.name) blockers.push(`repair_artifact_present:${tableName}:${String(artifactRow.name)}`);
+			let rowCount = null;
+			if (!allowsDataLoss) {
+				const quotedTable = quoteSqlIdentifier(tableName);
+				const countRow = await db.prepare(`SELECT COUNT(*) AS total FROM (SELECT 1 FROM ${quotedTable} LIMIT ${D1_SCHEMA_REPAIR_ROW_LIMIT + 1})`).first();
+				rowCount = Math.max(0, Number(countRow?.total) || 0);
+			}
+			if (!allowsDataLoss && rowCount > D1_SCHEMA_REPAIR_ROW_LIMIT) blockers.push(`rebuild_row_limit_exceeded:${tableName}:${rowCount}`);
+			if (!allowsDataLoss && !blockers.length) {
+				const keyState = await kernel.probeD1UniqueKeyRepair(db, tableName, expectedPrimaryKey);
+				if (keyState.empty) blockers.push(`primary_key_empty:${tableName}`);
+				if (keyState.duplicate) blockers.push(`primary_key_duplicate:${tableName}`);
+			}
+			return {
+				repairable: blockers.length === 0,
+				rowCount,
+				estimatedRowsIsLowerBound: rowCount !== null && rowCount > D1_SCHEMA_REPAIR_ROW_LIMIT,
+				rowCountMeasured: rowCount !== null,
+				allowsDataLoss,
+				blockers
+			};
+		},
+		async buildD1SchemaRepairPlan(db) {
+			const snapshot = await kernel.getD1SchemaSnapshot(db);
+			const status = await kernel.getD1SchemaStatus(db, { snapshot });
 			const contract = kernel.getD1CurrentSchemaContract();
-			const incompatible = [];
-			for (const [tableName, exists] of Object.entries(current.tables || {})) {
-				if (!exists) continue;
-				for (const [columnName, ready] of Object.entries(current.columns?.[tableName] || {})) if (!ready) {
-					const suffix = `${tableName}.${columnName}`;
-					incompatible.push((current.issues || []).find((issue) => String(issue).endsWith(suffix)) || `missing_column:${suffix}`);
+			const schemaFingerprint = hashStableText(serializeConfigValue(snapshot.objects || []));
+			const schemaCookie = await kernel.getD1SchemaCookie(db);
+			const contractHash = kernel.getD1ContractHash();
+			const storedMeta = await kernel.readD1SchemaMeta(db);
+			const repairableIssues = [];
+			const highRiskIssues = [];
+			const blockingIssues = [];
+			const steps = [];
+			const pushStep = (kind, target, risk = "low", estimatedRows = 0, extra = {}) => steps.push({ kind, target, risk, estimatedRows: estimatedRows === null ? null : Math.max(0, Number(estimatedRows) || 0), ...extra });
+			if (Math.max(0, Number(storedMeta?.contract_version) || 0) > D1_SCHEMA_CONTRACT_VERSION) blockingIssues.push(`schema_version_ahead:${Math.max(0, Number(storedMeta.contract_version) || 0)}`);
+			for (const [tableName, exists] of Object.entries(status.tables || {})) {
+				if (!exists) {
+					const issue = `missing_table:${tableName}`;
+					repairableIssues.push(issue);
+					pushStep("create_table", tableName);
+					continue;
 				}
-				if (current.constraints?.primaryKeys?.[tableName] !== true) incompatible.push(`invalid_primary_key:${tableName}`);
+				const lossyLogsRebuild = tableName === kernel.LOGS_TABLE && status.constraints?.primaryKeys?.[tableName] !== true;
+				for (const [columnName, ready] of Object.entries(status.columns?.[tableName] || {})) {
+					if (ready) continue;
+					const suffix = `${tableName}.${columnName}`;
+					const issue = (status.issues || []).find((item) => String(item).endsWith(suffix)) || `missing_column:${suffix}`;
+					if (lossyLogsRebuild && String(issue).startsWith("missing_column:")) highRiskIssues.push(issue);
+					else if (String(issue).startsWith("missing_column:") && kernel.getD1RuntimeColumnAdditions()?.[tableName]?.[columnName]) {
+						repairableIssues.push(issue);
+						pushStep("add_column", suffix);
+					} else blockingIssues.push(issue);
+				}
+				if (status.constraints?.primaryKeys?.[tableName] !== true) {
+					const issue = `invalid_primary_key:${tableName}`;
+					const probe = await kernel.probeD1PrimaryKeyRepair(db, tableName, contract);
+					if (probe.repairable) {
+						highRiskIssues.push(issue);
+						pushStep(probe.allowsDataLoss === true ? "recreate_log_table" : "rebuild_table", tableName, "high", probe.rowCount, {
+							allowsDataLoss: probe.allowsDataLoss === true,
+							willDiscardData: probe.allowsDataLoss === true,
+							dataMode: probe.allowsDataLoss === true ? "discard" : "copy",
+							estimatedRowsIsLowerBound: probe.estimatedRowsIsLowerBound === true,
+							rowCountMeasured: probe.rowCountMeasured === true
+						});
+					} else blockingIssues.push(issue, ...probe.blockers);
+				}
 			}
-			if (current.tables?.[kernel.DNS_IP_POOL_ITEMS_TABLE] && current.constraints?.uniqueKeys?.[`${kernel.DNS_IP_POOL_ITEMS_TABLE}.ip`] !== true) incompatible.push(`missing_unique_key:${kernel.DNS_IP_POOL_ITEMS_TABLE}.ip`);
-			for (const [indexName, ready] of Object.entries(current.indexes || {})) if (!ready) {
-				const owner = await db.prepare("SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ? LIMIT 1").bind(indexName).first();
-				if (owner) incompatible.push(`invalid_index:${indexName}`);
+			for (const issue of status.issues || []) if (/^unsupported_(?:required_columns|unique_indexes|triggers):/.test(String(issue))) {
+				const tableName = String(issue).split(":", 2)[1];
+				if (tableName === kernel.LOGS_TABLE && status.constraints?.primaryKeys?.[tableName] !== true) continue;
+				blockingIssues.push(issue);
 			}
-			if (current.fts?.tableReady && current.ftsReady !== true) incompatible.push("fts_contract_invalid");
-			if (incompatible.length) {
-				const error = new Error("Existing D1 schema does not match the current contract");
-				error.code = "D1_SCHEMA_INCOMPATIBLE";
+			const uniqueKey = `${kernel.DNS_IP_POOL_ITEMS_TABLE}.ip`;
+			if (status.tables?.[kernel.DNS_IP_POOL_ITEMS_TABLE] && status.constraints?.uniqueKeys?.[uniqueKey] !== true && status.columns?.[kernel.DNS_IP_POOL_ITEMS_TABLE]?.ip === true) {
+				const state = await kernel.probeD1UniqueKeyRepair(db, kernel.DNS_IP_POOL_ITEMS_TABLE, ["ip"]);
+				if (state.empty) blockingIssues.push(`unique_key_empty:${uniqueKey}`);
+				if (state.duplicate) blockingIssues.push(`unique_key_duplicate:${uniqueKey}`);
+				if (!state.empty && !state.duplicate) {
+					repairableIssues.push(`missing_unique_key:${uniqueKey}`);
+					pushStep("create_unique_index", "ux_dns_ip_pool_items_ip");
+				}
+			}
+			const recreatesLogs = steps.some((step) => step.kind === "recreate_log_table" && step.target === kernel.LOGS_TABLE);
+			for (const [indexName, ready] of Object.entries(status.indexes || {})) if (!ready) {
+				const issue = (status.issues || []).includes(`invalid_index:${indexName}`) ? `invalid_index:${indexName}` : `missing_index:${indexName}`;
+				repairableIssues.push(issue);
+				if (!(recreatesLogs && contract.indexes?.[indexName]?.table === kernel.LOGS_TABLE)) pushStep(issue.startsWith("invalid_") ? "repair_index" : "create_index", indexName);
+			}
+			if (status.ftsReady !== true) {
+				const issue = status.fts?.tableReady ? "fts_contract_invalid" : `missing_table:${kernel.LOGS_FTS_TABLE}`;
+				repairableIssues.push(issue);
+				if (!recreatesLogs) pushStep(status.fts?.tableReady ? "recreate_fts" : "create_fts", kernel.LOGS_FTS_TABLE);
+			}
+			const unique = (values) => [...new Set(values.map((value) => String(value || "").trim()).filter(Boolean))];
+			const normalizedSteps = [...new Map(steps.map((step) => [`${step.kind}:${step.target}`, step])).values()].sort((left, right) => `${left.risk}:${left.kind}:${left.target}`.localeCompare(`${right.risk}:${right.kind}:${right.target}`));
+			const normalizedRepairable = unique(repairableIssues);
+			const normalizedHighRisk = unique(highRiskIssues);
+			const normalizedBlocking = unique(blockingIssues);
+			const safeSteps = normalizedSteps.filter((step) => step.risk !== "high");
+			const highRiskSteps = normalizedSteps.filter((step) => step.risk === "high");
+			const risk = normalizedBlocking.length ? "blocked" : normalizedHighRisk.length ? "high" : normalizedRepairable.length ? "low" : "none";
+			const phase = normalizedBlocking.length ? "blocked" : safeSteps.length ? "safe" : highRiskSteps.length ? "destructive" : "ready";
+			const planHash = hashStableText(serializeConfigValue({ version: D1_SCHEMA_REPAIR_PLAN_VERSION, contractVersion: D1_SCHEMA_CONTRACT_VERSION, contractHash, schemaCookie, schemaFingerprint, phase, repairableIssues: normalizedRepairable, highRiskIssues: normalizedHighRisk, blockingIssues: normalizedBlocking, steps: normalizedSteps }));
+			return {
+				version: D1_SCHEMA_REPAIR_PLAN_VERSION,
+				phase,
+				contractVersion: D1_SCHEMA_CONTRACT_VERSION,
+				contractHash,
+				schemaCookie,
+				planHash,
+				schemaFingerprint,
+				risk,
+				repairableIssues: normalizedRepairable,
+				highRiskIssues: normalizedHighRisk,
+				blockingIssues: normalizedBlocking,
+				steps: normalizedSteps,
+				status
+			};
+		},
+		async createD1SchemaRepairToken(env, plan, options = {}) {
+			const secret = String(env?.JWT_SECRET || "").trim();
+			if (!secret) { const error = new Error("JWT_SECRET is required to sign the D1 schema repair plan"); error.code = "SERVER_MISCONFIGURED"; error.status = 503; throw error; }
+			const issuedAt = Math.max(0, Math.floor(Number(options.nowMs ?? nowMs()) / 1e3));
+			const expiresAt = issuedAt + Math.floor(D1_SCHEMA_REPAIR_TOKEN_TTL_MS / 1e3);
+			const payloadPart = encodeBase64UrlUtf8(JSON.stringify({
+				version: D1_SCHEMA_REPAIR_PLAN_VERSION,
+				scope: "d1_schema_repair",
+				phase: String(plan?.phase || ""),
+				contractVersion: Math.max(0, Number(plan?.contractVersion) || 0),
+				contractHash: String(plan?.contractHash || ""),
+				schemaCookie: Math.max(0, Number(plan?.schemaCookie) || 0),
+				planHash: String(plan?.planHash || ""),
+				schemaFingerprint: String(plan?.schemaFingerprint || ""),
+				destructiveTargets: (plan?.steps || []).filter((step) => step?.risk === "high").map((step) => String(step?.target || "")),
+				issuedAt,
+				expiresAt
+			}));
+			return { token: `${payloadPart}.${await signHmac(secret, payloadPart)}`, expiresAt };
+		},
+		async verifyD1SchemaRepairToken(env, token, plan, options = {}) {
+			const secret = String(env?.JWT_SECRET || "").trim();
+			const rawToken = String(token || "").trim();
+			const stale = (reason, details = {}) => { const error = new Error("D1 schema repair plan is stale"); error.code = "D1_SCHEMA_REPAIR_PLAN_STALE"; error.status = 409; error.details = { reason, ...details }; return error; };
+			if (!secret) { const error = new Error("JWT_SECRET is required to verify the D1 schema repair plan"); error.code = "SERVER_MISCONFIGURED"; error.status = 503; throw error; }
+			const dotIndex = rawToken.indexOf(".");
+			if (dotIndex <= 0 || dotIndex === rawToken.length - 1) throw stale("invalid_token");
+			const payloadPart = rawToken.slice(0, dotIndex);
+			if (rawToken.slice(dotIndex + 1) !== await signHmac(secret, payloadPart)) throw stale("invalid_signature");
+			let payload = null;
+			try { payload = JSON.parse(decodeBase64UrlUtf8(payloadPart)); } catch {}
+			if (!isPlainObject(payload) || payload.version !== D1_SCHEMA_REPAIR_PLAN_VERSION || payload.scope !== "d1_schema_repair" || payload.phase !== "destructive") throw stale("invalid_payload");
+			const nowSeconds = Math.max(0, Math.floor(Number(options.nowMs ?? nowMs()) / 1e3));
+			if (Number(payload.expiresAt) <= nowSeconds) throw stale("expired", { expiresAt: Number(payload.expiresAt) || 0 });
+			if (String(payload.planHash || "") !== String(plan?.planHash || "") || String(payload.schemaFingerprint || "") !== String(plan?.schemaFingerprint || "") || Number(payload.schemaCookie) !== Number(plan?.schemaCookie) || String(payload.contractHash || "") !== String(plan?.contractHash || "") || Number(payload.contractVersion) !== Number(plan?.contractVersion)) throw stale("schema_changed", { previewPlanHash: String(payload.planHash || ""), currentPlanHash: String(plan?.planHash || "") });
+			return payload;
+		},
+		getD1SchemaRepairTokenPlanHash(token) {
+			const payloadPart = String(token || "").trim().split(".", 1)[0];
+			if (!payloadPart) return "";
+			try {
+				const payload = JSON.parse(decodeBase64UrlUtf8(payloadPart));
+				return payload?.scope === "d1_schema_repair" ? String(payload?.planHash || "").trim() : "";
+			} catch {
+				return "";
+			}
+		},
+		async getD1TimeTravelBookmark(db) {
+			if (!db || typeof db.withSession !== "function") { const error = new Error("D1 Time Travel bookmark is unavailable on this binding"); error.code = "D1_SCHEMA_REPAIR_RECOVERY_UNAVAILABLE"; error.status = 409; error.details = { reason: "sessions_api_unavailable" }; throw error; }
+			try {
+				const session = db.withSession("first-primary");
+				if (!session || typeof session.prepare !== "function" || typeof session.getBookmark !== "function") throw new Error("invalid_d1_session");
+				await session.prepare("SELECT 1 AS bookmark_probe").run();
+				const bookmark = String(session.getBookmark() || "").trim();
+				if (!bookmark) throw new Error("empty_bookmark");
+				return { bookmark, consistency: "first-primary", capturedAt: (/* @__PURE__ */ new Date()).toISOString() };
+			} catch (cause) {
+				if (String(cause?.code || "") === "D1_SCHEMA_REPAIR_RECOVERY_UNAVAILABLE") throw cause;
+				const error = new Error("Unable to capture a D1 Time Travel bookmark");
+				error.code = "D1_SCHEMA_REPAIR_RECOVERY_UNAVAILABLE";
 				error.status = 409;
-				error.details = { phase: "preflight", issues: [...new Set(incompatible)] };
+				error.details = { reason: "bookmark_failed", cause: getErrorMessage(cause, "bookmark_failed") };
 				throw error;
 			}
-			return true;
+		},
+		async ensureD1KnownColumns(db, options = {}) {
+			const tableNames = await kernel.getD1TableNameSet(db);
+			const skippedTables = new Set(Array.isArray(options.skipTables) ? options.skipTables : []);
+			const addedColumns = [];
+			for (const [tableName, additions] of Object.entries(kernel.getD1RuntimeColumnAdditions())) {
+				if (!tableNames.has(tableName) || skippedTables.has(tableName)) continue;
+				const columns = await kernel.getTableColumns(db, tableName);
+				for (const [columnName, definition] of Object.entries(additions)) {
+					if (columns.has(columnName)) continue;
+					await db.prepare(`ALTER TABLE ${quoteSqlIdentifier(tableName)} ADD COLUMN ${quoteSqlIdentifier(columnName)} ${definition}`).run();
+					columns.add(columnName);
+					addedColumns.push(`${tableName}.${columnName}`);
+				}
+			}
+			return addedColumns;
+		},
+		async repairD1RuntimeIndexes(db, options = {}) {
+			const tableNames = await kernel.getD1TableNameSet(db);
+			const skippedTables = new Set(Array.isArray(options.skipTables) ? options.skipTables : []);
+			const createdIndexes = [];
+			const repairedIndexes = [];
+			for (const [indexName, definition] of Object.entries(kernel.getD1RuntimeIndexContract())) {
+				if (!tableNames.has(definition.table)) continue;
+				if (skippedTables.has(definition.table)) continue;
+				const owner = await db.prepare("SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ? LIMIT 1").bind(indexName).first();
+				let valid = false;
+				if (owner) {
+					const listed = (await kernel.getTableIndexDefinitions(db, definition.table)).find((item) => item.name === indexName);
+					valid = String(owner?.tbl_name || "") === definition.table && listed?.unique === false && listed?.partial === false && serializeConfigValue(await kernel.getIndexKeyColumns(db, indexName)) === serializeConfigValue(definition.columns);
+				}
+				if (valid) continue;
+				if (owner) { await db.prepare(`DROP INDEX IF EXISTS ${quoteSqlIdentifier(indexName)}`).run(); repairedIndexes.push(indexName); }
+				else createdIndexes.push(indexName);
+				await db.prepare(definition.createSql).run();
+			}
+			return { createdIndexes, repairedIndexes };
+		},
+		async ensureD1UniqueIndexes(db) {
+			const uniqueIndexesCreated = [];
+			for (const [indexName, definition] of Object.entries(kernel.getD1UniqueIndexContract())) {
+				const tableNames = await kernel.getD1TableNameSet(db);
+				if (!tableNames.has(definition.table)) continue;
+				let ready = false;
+				for (const index of (await kernel.getTableIndexDefinitions(db, definition.table)).filter((item) => item.unique && !item.partial)) {
+					if (serializeConfigValue(await kernel.getIndexKeyColumns(db, index.name)) === serializeConfigValue(definition.columns)) { ready = true; break; }
+				}
+				if (ready) continue;
+				const owner = await db.prepare("SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ? LIMIT 1").bind(indexName).first();
+				if (owner) await db.prepare(`DROP INDEX IF EXISTS ${quoteSqlIdentifier(indexName)}`).run();
+				await db.prepare(definition.createSql).run();
+				uniqueIndexesCreated.push(indexName);
+			}
+			return uniqueIndexesCreated;
+		},
+		async rebuildD1TableWithShadow(db, tableName, plan) {
+			const contract = kernel.getD1CurrentSchemaContract();
+			if (!Object.prototype.hasOwnProperty.call(contract.columns, tableName)) throw new Error(`Unknown D1 rebuild table: ${tableName}`);
+			if (tableName === kernel.LOGS_TABLE) throw new Error("proxy_logs must use destructive atomic recreation");
+			const suffix = String(plan?.planHash || "repair").replace(/[^a-z0-9]/gi, "").slice(0, 12) || "repair";
+			const tempTable = `__d1_repair_${tableName}_${suffix}`;
+			const backupTable = `__d1_backup_${tableName}_${suffix}`;
+			const existing = await kernel.getD1TableNameSet(db);
+			if (existing.has(tempTable) || existing.has(backupTable)) { const error = new Error("D1 schema repair temporary table already exists"); error.code = "D1_SCHEMA_REPAIR_BLOCKED"; error.status = 409; error.details = { phase: "preflight", blockingIssues: [`repair_artifact_present:${tableName}`] }; throw error; }
+			const columns = contract.columns[tableName];
+			const quotedColumns = columns.map((column) => quoteSqlIdentifier(column)).join(", ");
+			const originalIndexes = (await db.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL").bind(tableName).all())?.results || [];
+			await db.prepare(kernel.buildD1CreateTableSql(tableName, tempTable)).run();
+			try {
+				await db.batch([
+					db.prepare(`INSERT INTO ${quoteSqlIdentifier(tempTable)} (${quotedColumns}) SELECT ${quotedColumns} FROM ${quoteSqlIdentifier(tableName)}`),
+					db.prepare(`ALTER TABLE ${quoteSqlIdentifier(tableName)} RENAME TO ${quoteSqlIdentifier(backupTable)}`),
+					db.prepare(`ALTER TABLE ${quoteSqlIdentifier(tempTable)} RENAME TO ${quoteSqlIdentifier(tableName)}`),
+					...originalIndexes.map((index) => db.prepare(`DROP INDEX ${quoteSqlIdentifier(index.name)}`)),
+					...originalIndexes.map((index) => db.prepare(String(index.sql)))
+				]);
+			} catch (error) {
+				await db.prepare(`DROP TABLE IF EXISTS ${quoteSqlIdentifier(tempTable)}`).run().catch(() => {});
+				throw error;
+			}
+			const row = await db.prepare(`SELECT COUNT(*) AS total FROM ${quoteSqlIdentifier(tableName)}`).first();
+			return {
+				table: tableName,
+				rowCount: Math.max(0, Number(row?.total) || 0),
+				allowsDataLoss: false,
+				willDiscardData: false,
+				dataMode: "copy",
+				backupTable,
+				originalIndexes
+			};
+		},
+		async recreateD1LogsDestructively(db, plan) {
+			const step = (plan?.steps || []).find((item) => item?.kind === "recreate_log_table" && item?.target === kernel.LOGS_TABLE);
+			if (!step || step.willDiscardData !== true || step.dataMode !== "discard") throw new Error("Missing destructive proxy_logs repair step");
+			const fts = kernel.getD1LogsFtsContractSql();
+			const logIndexes = Object.values(kernel.getD1RuntimeIndexContract()).filter((definition) => definition.table === kernel.LOGS_TABLE);
+			await db.batch([
+				db.prepare(`DROP TABLE IF EXISTS ${quoteSqlIdentifier(kernel.LOGS_FTS_TABLE)}`),
+				db.prepare(`DROP TABLE ${quoteSqlIdentifier(kernel.LOGS_TABLE)}`),
+				db.prepare(kernel.buildD1CreateTableSql(kernel.LOGS_TABLE)),
+				...logIndexes.map((definition) => db.prepare(definition.createSql)),
+				db.prepare(fts.createTable),
+				db.prepare(fts.createTrigger)
+			]);
+			return {
+				table: kernel.LOGS_TABLE,
+				rowCount: 0,
+				rowCountMeasured: false,
+				discardedRows: null,
+				discardedRowsIsLowerBound: false,
+				allowsDataLoss: true,
+				willDiscardData: true,
+				dataMode: "discard"
+			};
+		},
+		async rollbackD1RebuiltTables(db, rebuiltTables = []) {
+			for (const rebuilt of [...rebuiltTables].reverse()) {
+				const tableName = String(rebuilt?.table || "");
+				const backupTable = String(rebuilt?.backupTable || "");
+				if (!tableName || !backupTable || !(await kernel.getD1TableNameSet(db)).has(backupTable)) continue;
+				if (tableName === kernel.LOGS_TABLE) { await kernel.dropLogsFtsSyncTriggers(db).catch(() => 0); await db.prepare(`DROP TABLE IF EXISTS ${quoteSqlIdentifier(kernel.LOGS_FTS_TABLE)}`).run().catch(() => {}); }
+				for (const row of (await db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL").bind(tableName).all())?.results || []) await db.prepare(`DROP INDEX IF EXISTS ${quoteSqlIdentifier(row.name)}`).run().catch(() => {});
+				await db.batch([
+					db.prepare(`DROP TABLE IF EXISTS ${quoteSqlIdentifier(tableName)}`),
+					db.prepare(`ALTER TABLE ${quoteSqlIdentifier(backupTable)} RENAME TO ${quoteSqlIdentifier(tableName)}`)
+				]);
+				for (const index of rebuilt.originalIndexes || []) {
+					const sql = String(index?.sql || "").replace(/^CREATE\s+(UNIQUE\s+)?INDEX\s+/i, (_match, unique) => `CREATE ${unique || ""}INDEX IF NOT EXISTS `);
+					if (sql) await db.prepare(sql).run().catch(() => {});
+				}
+				if (tableName === kernel.LOGS_TABLE) await kernel.ensureLogsFtsSchema(db, { forceRecreate: true }).catch(() => {});
+			}
+		},
+		async assertD1CurrentSchema(db) {
+			const plan = await kernel.buildD1SchemaRepairPlan(db);
+			if (plan.blockingIssues.length) { const error = new Error("D1 schema repair is blocked by incompatible data or table shape"); error.code = "D1_SCHEMA_REPAIR_BLOCKED"; error.status = 409; error.details = { phase: "preflight", blockingIssues: plan.blockingIssues, repairPlan: plan }; throw error; }
+			return plan;
 		},
 		async initializeD1Database(db, options = {}) {
 			if (!db) { const error = new Error("D1 not configured"); error.code = "D1_NOT_CONFIGURED"; error.status = 503; throw error; }
 			const profile = options.includeFts === false ? "logs-core" : "logs-fts";
 			let state = databaseReadinessState.D1DatabaseInitReady.get(db);
 			if (!state || !(state.inFlight instanceof Map)) { state = { tail: Promise.resolve(), inFlight: new Map() }; databaseReadinessState.D1DatabaseInitReady.set(db, state); }
-			let initTask = state.inFlight.get(profile);
+			const tokenPlanHash = kernel.getD1SchemaRepairTokenPlanHash(options.repairToken);
+			const operationKey = `${profile}:${tokenPlanHash || "automatic"}`;
+			let initTask = state.inFlight.get(operationKey);
 			if (!initTask) {
 				initTask = Promise.resolve(state.tail).catch(() => {}).then(() => kernel.runD1DatabaseInitialization(db, { ...options, profile }));
 				state.tail = initTask.catch(() => {});
-				state.inFlight.set(profile, initTask);
+				state.inFlight.set(operationKey, initTask);
 			}
 			try { return await initTask; }
-			finally { if (state.inFlight.get(profile) === initTask) state.inFlight.delete(profile); }
+			finally { if (state.inFlight.get(operationKey) === initTask) state.inFlight.delete(operationKey); }
 		},
 		async runD1DatabaseInitialization(db, options = {}) {
 			const profile = options.profile || (options.includeFts === false ? "logs-core" : "logs-fts");
+			const repairMode = String(options.repairMode || (String(options.repairToken || "").trim() ? "confirmed-destructive" : "safe"));
 			kernel.invalidateD1SchemaReadiness(db, "all");
-			const tablesBefore = await kernel.getD1TableNameSet(db);
-			const statusBefore = await kernel.getD1SchemaStatus(db);
-			await kernel.assertD1CurrentSchema(db, statusBefore);
+			const plan = await kernel.buildD1SchemaRepairPlan(db);
+			const tablesBefore = new Set(Object.entries(plan.status?.tables || {}).filter(([, ready]) => ready === true).map(([name]) => name));
+			if (plan.status?.fts?.tableReady === true) tablesBefore.add(kernel.LOGS_FTS_TABLE);
+			if (plan.blockingIssues.length) { const error = new Error("D1 schema repair is blocked by incompatible data or table shape"); error.code = "D1_SCHEMA_REPAIR_BLOCKED"; error.status = 409; error.details = { phase: "preflight", blockingIssues: plan.blockingIssues, repairPlan: plan }; throw error; }
+			let bookmarkState = null;
+			if (plan.phase === "safe" && repairMode === "confirmed-destructive") {
+				const error = new Error("D1 schema repair must complete safe preparation before destructive repair");
+				error.code = "D1_SCHEMA_REPAIR_PREPARATION_REQUIRED";
+				error.status = 409;
+				error.details = { repairPlan: plan };
+				throw error;
+			}
+			if (plan.phase === "destructive") {
+				if (options.confirmHighRisk !== true || !String(options.repairToken || "").trim()) {
+					const tokenState = options.env ? await kernel.createD1SchemaRepairToken(options.env, plan) : { token: "", expiresAt: 0 };
+					const error = new Error("D1 schema repair requires explicit confirmation");
+					error.code = "D1_SCHEMA_REPAIR_CONFIRMATION_REQUIRED";
+					error.status = 428;
+					error.details = { repairPlan: { ...plan, repairToken: tokenState.token, expiresAt: tokenState.expiresAt ? new Date(tokenState.expiresAt * 1e3).toISOString() : "" } };
+					throw error;
+				}
+				await kernel.verifyD1SchemaRepairToken(options.env, options.repairToken, plan);
+				bookmarkState = await kernel.getD1TimeTravelBookmark(db);
+			}
+			const rebuiltTables = [];
+			const executedSteps = [];
+			let leaseOwner = "";
 			try {
-				const bootstrap = await kernel.bootstrapD1Schema(db, profile);
+				const metaCreateStep = plan.steps.find((step) => step.kind === "create_table" && step.target === kernel.D1_SCHEMA_META_TABLE && step.risk !== "high");
+				if (metaCreateStep) {
+					await db.prepare(kernel.buildD1CreateTableSql(kernel.D1_SCHEMA_META_TABLE, kernel.D1_SCHEMA_META_TABLE, { ifNotExists: true })).run();
+					executedSteps.push({ kind: "create_table", target: kernel.D1_SCHEMA_META_TABLE });
+				}
+				if (plan.phase === "safe" || plan.phase === "destructive") {
+					leaseOwner = String(globalThis.crypto?.randomUUID?.() || `${nowMs()}-${Math.random()}`);
+					await kernel.acquireD1SchemaRepairLease(db, leaseOwner);
+				}
+				if (plan.phase === "destructive") {
+					const lockedPlan = await kernel.buildD1SchemaRepairPlan(db);
+					await kernel.verifyD1SchemaRepairToken(options.env, options.repairToken, lockedPlan);
+				}
+				const executableSteps = plan.phase === "safe" ? plan.steps.filter((step) => step.risk !== "high") : plan.phase === "destructive" ? plan.steps.filter((step) => step.risk === "high") : [];
+				const createTargets = executableSteps.filter((step) => step.kind === "create_table" && step.target !== kernel.LOGS_FTS_TABLE && step.target !== kernel.D1_SCHEMA_META_TABLE).map((step) => step.target);
+				for (const tableName of createTargets) {
+					await db.prepare(kernel.buildD1CreateTableSql(tableName, tableName, { ifNotExists: true })).run();
+					executedSteps.push({ kind: "create_table", target: tableName });
+				}
+				const rebuildSteps = executableSteps.filter((step) => step.kind === "rebuild_table");
+				const rebuildTargets = rebuildSteps.map((step) => step.target);
+				const destructiveLogStep = executableSteps.find((step) => step.kind === "recreate_log_table" && step.target === kernel.LOGS_TABLE);
+				const addedColumns = [];
+				for (const step of executableSteps.filter((item) => item.kind === "add_column")) {
+					const [tableName, columnName] = String(step.target || "").split(".", 2);
+					const definition = kernel.getD1RuntimeColumnAdditions()?.[tableName]?.[columnName];
+					if (!definition) throw new Error(`Unknown D1 column addition: ${step.target}`);
+					await db.prepare(`ALTER TABLE ${quoteSqlIdentifier(tableName)} ADD COLUMN ${quoteSqlIdentifier(columnName)} ${definition}`).run();
+					addedColumns.push(step.target);
+					executedSteps.push({ kind: "add_column", target: step.target });
+				}
+				for (const tableName of rebuildTargets) {
+					rebuiltTables.push(await kernel.rebuildD1TableWithShadow(db, tableName, plan));
+					executedSteps.push({ kind: "rebuild_table", target: tableName });
+				}
+				if (destructiveLogStep) {
+					rebuiltTables.push(await kernel.recreateD1LogsDestructively(db, plan));
+					executedSteps.push({ kind: "recreate_log_table", target: kernel.LOGS_TABLE });
+				}
+				const destructivelyCreatedIndexes = destructiveLogStep ? Object.entries(kernel.getD1RuntimeIndexContract()).filter(([, definition]) => definition.table === kernel.LOGS_TABLE).map(([name]) => name) : [];
+				const indexChanges = { createdIndexes: [], repairedIndexes: [] };
+				for (const step of executableSteps.filter((item) => item.kind === "create_index" || item.kind === "repair_index")) {
+					const definition = kernel.getD1RuntimeIndexContract()?.[step.target];
+					if (!definition) throw new Error(`Unknown D1 runtime index: ${step.target}`);
+					if (step.kind === "repair_index") await db.prepare(`DROP INDEX IF EXISTS ${quoteSqlIdentifier(step.target)}`).run();
+					await db.prepare(definition.createSql).run();
+					indexChanges[step.kind === "repair_index" ? "repairedIndexes" : "createdIndexes"].push(step.target);
+					executedSteps.push({ kind: step.kind, target: step.target });
+				}
+				const uniqueIndexesCreated = [];
+				for (const step of executableSteps.filter((item) => item.kind === "create_unique_index")) {
+					const definition = kernel.getD1UniqueIndexContract()?.[step.target];
+					if (!definition) throw new Error(`Unknown D1 unique index: ${step.target}`);
+					await db.prepare(definition.createSql).run();
+					uniqueIndexesCreated.push(step.target);
+					executedSteps.push({ kind: step.kind, target: step.target });
+				}
+				let ftsResult = { rebuilt: false, recreated: false };
+				const ftsStep = executableSteps.find((step) => step.target === kernel.LOGS_FTS_TABLE);
+				if (ftsStep && options.includeFts !== false) ftsResult = await kernel.ensureLogsFtsSchema(db, { forceRecreate: true, baseSchemaReady: true });
+				if (ftsResult?.rebuilt === true) executedSteps.push({ kind: String(ftsStep?.kind || "create_fts"), target: kernel.LOGS_FTS_TABLE });
 				kernel.invalidateD1SchemaReadiness(db, "all");
-				const status = await kernel.getD1SchemaStatus(db);
-				if (!status.schemaReady) {
-					const error = new Error("D1 schema initialization did not produce the current contract");
-					error.code = "D1_SCHEMA_INCOMPATIBLE";
-					error.status = 409;
+				const finalSnapshot = await kernel.getD1SchemaSnapshot(db);
+				const status = await kernel.getD1SchemaStatus(db, { snapshot: finalSnapshot });
+				const finalSchemaFingerprint = hashStableText(serializeConfigValue(finalSnapshot.objects || []));
+				const nextPlan = status.schemaReady ? null : await kernel.buildD1SchemaRepairPlan(db);
+				const pendingHighRisk = nextPlan?.phase === "destructive";
+				if (!status.schemaReady && !pendingHighRisk) {
+					const error = new Error("D1 schema repair did not produce the current contract");
+					error.code = "D1_SCHEMA_REPAIR_FAILED";
+					error.status = 503;
 					error.details = { phase: "final_status", issues: status.issues };
 					throw error;
 				}
-				const createdTables = [...await kernel.getD1TableNameSet(db)].filter((name) => !tablesBefore.has(name));
+				const backupTables = rebuiltTables.filter((rebuilt) => rebuilt?.backupTable);
+				if (backupTables.length) await db.batch(backupTables.map((rebuilt) => db.prepare(`DROP TABLE IF EXISTS ${quoteSqlIdentifier(rebuilt.backupTable)}`)));
+				let schemaMeta = { written: false, reason: "pending_high_risk" };
+				if (status.schemaReady) {
+					if (plan.phase === "ready") {
+						const attested = await kernel.verifyD1SchemaAttestation(db, options.env);
+						schemaMeta = attested.valid ? { written: false, reused: true, contractVersion: D1_SCHEMA_CONTRACT_VERSION, contractHash: plan.contractHash } : await kernel.writeVerifiedD1SchemaMeta(db, options.env, { ...plan, schemaFingerprint: finalSchemaFingerprint });
+					} else schemaMeta = await kernel.writeVerifiedD1SchemaMeta(db, options.env, { ...plan, schemaFingerprint: finalSchemaFingerprint });
+				}
+				const reportableTables = new Set([...Object.keys(kernel.getD1CurrentSchemaContract().columns), kernel.LOGS_FTS_TABLE]);
+				const createdTables = finalSnapshot.objects.filter((row) => row?.type === "table").map((row) => String(row?.name || "")).filter((name) => reportableTables.has(name) && !tablesBefore.has(name));
 				return {
 					profile,
-					schemaReady: true,
+					phase: plan.phase,
+					completed: status.schemaReady,
+					pendingHighRisk,
+					schemaReady: status.schemaReady,
+					contractVersion: D1_SCHEMA_CONTRACT_VERSION,
+					contractHash: plan.contractHash,
+					planHash: plan.planHash,
+					risk: plan.risk,
 					createdTables,
-					ftsRebuilt: bootstrap.ftsResult?.rebuilt === true,
-					ftsRecreated: bootstrap.ftsResult?.recreated === true,
-					steps: bootstrap.steps,
+					addedColumns,
+					createdIndexes: [...indexChanges.createdIndexes, ...destructivelyCreatedIndexes],
+					repairedIndexes: indexChanges.repairedIndexes,
+					uniqueIndexesCreated,
+					rebuiltTables: rebuiltTables.map(({ table, rowCount, rowCountMeasured, discardedRows, discardedRowsIsLowerBound, willDiscardData, dataMode }) => willDiscardData ? {
+						table,
+						rowCount,
+						rowCountMeasured,
+						discardedRows,
+						discardedRowsIsLowerBound,
+						allowsDataLoss: true,
+						willDiscardData: true,
+						dataMode
+					} : { table, rowCount }),
+					ftsRebuilt: ftsResult?.rebuilt === true,
+					ftsRecreated: destructiveLogStep ? true : ftsResult?.recreated === true && plan.status?.fts?.tableReady === true,
+					recoveryBookmark: String(bookmarkState?.bookmark || ""),
+					bookmarkCapturedAt: String(bookmarkState?.capturedAt || ""),
+					schemaMeta,
+					steps: plan.steps.map((step) => ({ ...step, ready: executedSteps.some((executed) => executed.kind === step.kind && executed.target === step.target) || status.schemaReady })),
 					status
 				};
 			} catch (error) {
-				throw error;
+				if (rebuiltTables.length) await kernel.rollbackD1RebuiltTables(db, rebuiltTables).catch(() => {});
+				kernel.invalidateD1SchemaReadiness(db, "all");
+				let remainingIssues = [];
+				try { remainingIssues = (await kernel.getD1SchemaStatus(db))?.issues || []; } catch {}
+				if (error && typeof error === "object") error.details = {
+					...isPlainObject(error.details) ? error.details : {},
+					executedSteps,
+					remainingIssues,
+					recoveryBookmark: String(bookmarkState?.bookmark || ""),
+					bookmarkCapturedAt: String(bookmarkState?.capturedAt || "")
+				};
+				if (String(error?.code || "").startsWith("D1_SCHEMA_REPAIR_")) throw error;
+				const wrapped = new Error(getErrorMessage(error, "D1 schema repair failed"));
+				wrapped.code = "D1_SCHEMA_REPAIR_FAILED";
+				wrapped.status = 503;
+				wrapped.details = { ...isPlainObject(error?.details) ? error.details : {}, phase: "execution" };
+				throw wrapped;
+			} finally {
+				if (leaseOwner) await kernel.releaseD1SchemaRepairLease(db, leaseOwner).catch(() => {});
 			}
 		},
 		async probeLogsReadiness(db, options = {}) {
@@ -23729,6 +24415,14 @@ function buildD1TidyExecutor() {
 			return {
 				...executionPlan.summary || {},
 				mode,
+				deletedExpiredLogCount: 0,
+				deletedExpiredLockCount: 0,
+				deletedExpiredFetchCacheCount: 0,
+				deletedExpiredProbeCacheCount: 0,
+				deletedExpiredAuthFailureCount: 0,
+				deletedExpiredDashboardCacheCount: 0,
+				deletedExpiredRuntimeCacheCount: 0,
+				deletedExpiredStatsHourlyCount: 0,
 				rebuiltStatsHourly: false,
 				rebuiltLogsFts: false,
 				alignedStatsWindow: false,
@@ -23748,101 +24442,74 @@ function buildD1TidyExecutor() {
 				reason: ""
 			};
 		},
-		buildDeleteSteps(database, executionPlan = {}, summary = {}, flags = {}, db) {
-			const steps = [
-				[
-					flags.deleteExpiredLogs,
-					summary.deletedExpiredLogCount,
-					"deleteExpiredLogs",
-					database.LOGS_TABLE,
-					"timestamp < ?",
-					executionPlan.retentionCutoffMs
-				],
-				[
-					flags.deleteExpiredLocks,
-					summary.deletedExpiredLockCount,
-					"deleteExpiredLocks",
-					database.SCHEDULED_LOCKS_TABLE,
-					"expires_at <= ?",
-					executionPlan.nowMs
-				],
-				[
-					flags.deleteExpiredFetchCache,
-					summary.deletedExpiredFetchCacheCount,
-					"deleteExpiredFetchCache",
-					database.DNS_IP_POOL_FETCH_CACHE_TABLE,
-					"expires_at <= ?",
-					executionPlan.nowMs
-				],
-				[
-					flags.deleteExpiredProbeCache,
-					summary.deletedExpiredProbeCacheCount,
-					"deleteExpiredProbeCache",
-					database.DNS_IP_PROBE_CACHE_TABLE,
-					"expires_at <= ?",
-					executionPlan.nowMs
-				],
-				[
-					flags.deleteExpiredAuthFailures,
-					summary.deletedExpiredAuthFailureCount,
-					"deleteExpiredAuthFailures",
-					database.AUTH_FAILURES_TABLE,
-					"expires_at <= ?",
-					executionPlan.nowMs
-				],
-				[
-					flags.deleteExpiredDashboardCache,
-					summary.deletedExpiredDashboardCacheCount,
-					"deleteExpiredDashboardCache",
-					database.CF_DASH_CACHE_TABLE,
-					"expires_at <= ?",
-					executionPlan.nowMs
-				],
-				[
-					flags.deleteExpiredRuntimeCache,
-					summary.deletedExpiredRuntimeCacheCount,
-					"deleteExpiredRuntimeCache",
-					database.CF_RUNTIME_CACHE_TABLE,
-					"expires_at <= ?",
-					executionPlan.nowMs
-				]
-			].map(([enabled, count, stepName, tableName, whereClause, bindParam]) => ({
-				enabled,
-				count,
-				stepName,
-				db,
-				sql: `DELETE FROM ${tableName} WHERE ${whereClause}`,
-				bindParams: [bindParam]
-			}));
-			return steps;
+		buildDeleteScopes(database, executionPlan = {}, flags = {}, db) {
+			const definitions = [
+				[flags.deleteExpiredLogs, "proxy_logs", "deletedExpiredLogCount", "deleteExpiredLogs", database.LOGS_TABLE, "timestamp < ?", [executionPlan.retentionCutoffMs]],
+				[flags.deleteExpiredLocks, "sys_locks", "deletedExpiredLockCount", "deleteExpiredLocks", database.SCHEDULED_LOCKS_TABLE, "expires_at <= ?", [executionPlan.nowMs]],
+				[flags.deleteExpiredFetchCache, "dns_ip_pool_fetch_cache", "deletedExpiredFetchCacheCount", "deleteExpiredFetchCache", database.DNS_IP_POOL_FETCH_CACHE_TABLE, "expires_at <= ?", [executionPlan.nowMs]],
+				[flags.deleteExpiredProbeCache, "dns_ip_probe_cache", "deletedExpiredProbeCacheCount", "deleteExpiredProbeCache", database.DNS_IP_PROBE_CACHE_TABLE, "expires_at <= ?", [executionPlan.nowMs]],
+				[flags.deleteExpiredAuthFailures, "auth_failures", "deletedExpiredAuthFailureCount", "deleteExpiredAuthFailures", database.AUTH_FAILURES_TABLE, "expires_at <= ?", [executionPlan.nowMs]],
+				[flags.deleteExpiredDashboardCache, "cf_dashboard_cache", "deletedExpiredDashboardCacheCount", "deleteExpiredDashboardCache", database.CF_DASH_CACHE_TABLE, "expires_at <= ?", [executionPlan.nowMs]],
+				[flags.deleteExpiredRuntimeCache, "cf_runtime_cache", "deletedExpiredRuntimeCacheCount", "deleteExpiredRuntimeCache", database.CF_RUNTIME_CACHE_TABLE, "expires_at <= ?", [executionPlan.nowMs]],
+				[flags.deleteExpiredStatsHourly, "proxy_stats_hourly", "deletedExpiredStatsHourlyCount", "deleteExpiredStatsHourly", database.STATS_HOURLY_TABLE, "bucket_date < ?", [executionPlan.statsRetentionBoundaryDate]]
+			];
+			return definitions.filter(([enabled]) => enabled === true).map(([, key, summaryKey, stepName, tableName, whereClause, bindParams]) => ({ key, summaryKey, stepName, tableName, whereClause, bindParams, db }));
 		},
-		async runDeleteStep({ enabled = false, count = 0, beforeStep = async (_stepName) => {}, stepName = "", db, sql = "", bindParams = [] }) {
-			if (enabled !== true || Number(count) <= 0) return false;
-			await beforeStep(stepName);
-			await db.prepare(sql).bind(...bindParams).run();
-			return true;
+		readChanges(result) {
+			const value = Number(result?.meta?.changes ?? result?.changes ?? 0);
+			return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
 		},
-		async runDeleteSteps(steps = [], beforeStep = async (_stepName) => {}) {
-			let performedWork = false;
-			for (const step of Array.isArray(steps) ? steps : []) performedWork = await executor.runDeleteStep({
-				beforeStep,
-				...isPlainObject(step) ? step : {}
-			}) || performedWork;
-			return performedWork;
+		async hasScopeRows(scope) {
+			return !!await scope.db.prepare(`SELECT 1 AS present FROM ${scope.tableName} WHERE ${scope.whereClause} LIMIT 1`).bind(...scope.bindParams).first();
+		},
+		async runBudgetedDeleteScopes(scopes = [], summary = {}, beforeStep = async (_stepName) => {}, options = {}) {
+			const startedAt = Number(options.startedAt) || nowMs();
+			let processedRows = 0;
+			let exhaustedBy = "";
+			let active = [...scopes];
+			while (active.length > 0 && !exhaustedBy) {
+				const nextActive = [];
+				for (const scope of active) {
+					if (processedRows >= D1_TIDY_ROW_LIMIT) { exhaustedBy = "row_limit"; break; }
+					if (nowMs() - startedAt >= D1_TIDY_TIME_LIMIT_MS) { exhaustedBy = "time_limit"; break; }
+					await beforeStep(scope.stepName);
+					const pageLimit = Math.min(D1_TIDY_BATCH_SIZE, D1_TIDY_ROW_LIMIT - processedRows);
+					const result = await scope.db.prepare(`DELETE FROM ${scope.tableName} WHERE rowid IN (SELECT rowid FROM ${scope.tableName} WHERE ${scope.whereClause} ORDER BY rowid LIMIT ?)`)
+						.bind(...scope.bindParams, pageLimit).run();
+					const changes = executor.readChanges(result);
+					processedRows += changes;
+					summary[scope.summaryKey] = Math.max(0, Number(summary[scope.summaryKey]) || 0) + changes;
+					if (changes >= pageLimit) nextActive.push(scope);
+				}
+				active = nextActive;
+			}
+			const remainingScopes = [];
+			for (const scope of scopes) if (await executor.hasScopeRows(scope)) remainingScopes.push(scope.key);
+			const durationMs = Math.max(0, nowMs() - startedAt);
+			if (!exhaustedBy && remainingScopes.length > 0) exhaustedBy = durationMs >= D1_TIDY_TIME_LIMIT_MS ? "time_limit" : processedRows >= D1_TIDY_ROW_LIMIT ? "row_limit" : "";
+			return {
+				hasMore: remainingScopes.length > 0,
+				remainingScopes,
+				budget: {
+					batchSize: D1_TIDY_BATCH_SIZE,
+					rowLimit: D1_TIDY_ROW_LIMIT,
+					timeLimitMs: D1_TIDY_TIME_LIMIT_MS,
+					processedRows,
+					durationMs,
+					exhaustedBy: exhaustedBy || null
+				}
+			};
 		},
 		async patchLogStatus(database, db, stores, executionPlan, summary, flags, options = {}) {
 			const nowIso = (/* @__PURE__ */ new Date()).toISOString();
 			const mode = String(executionPlan?.mode || options.mode || "manual").trim().toLowerCase() === "scheduled" ? "scheduled" : "manual";
-			const ftsReady = await database.isLogsFtsReady(db);
-			const statsReady = await database.hasStatsHourlyTable(db);
-			const schemaStatus = await database.getD1SchemaStatus(db);
 			const logPatch = {
 				schemaReady: true,
-				ftsReady,
-				statsReady,
-				categoryEnabled: true,
-				statsUtcOffsetMinutes: executionPlan.statsUtcOffsetMinutes || executionPlan.utcOffsetMinutes
+				ftsReady: true,
+				statsReady: true,
+				categoryEnabled: true
 			};
+			if (flags.rebuildStatsHourly !== true || summary.alignedStatsWindow === true) logPatch.statsUtcOffsetMinutes = executionPlan.statsUtcOffsetMinutes ?? executionPlan.utcOffsetMinutes;
 			if (summary.rebuiltStatsHourly === true || summary.alignedStatsWindow === true) {
 				logPatch.statsAlignedAt = nowIso;
 				logPatch.statsAlignedWindowStartAt = new Date((mode === "scheduled" ? executionPlan.statsStartTs : executionPlan.retentionCutoffMs) || executionPlan.retentionCutoffMs).toISOString();
@@ -23859,6 +24526,17 @@ function buildD1TidyExecutor() {
 //#region worker/features/storage/d1/tidy-planner.js
 function buildD1TidyPlanner() {
 	return {
+		async readBoundedCount(db, tableName, whereClause = "", bindParams = []) {
+			const predicate = String(whereClause || "").trim();
+			const sql = `SELECT COUNT(*) AS total FROM (SELECT 1 FROM ${tableName}${predicate ? ` WHERE ${predicate}` : ""} LIMIT ${D1_TIDY_PREVIEW_COUNT_LIMIT + 1})`;
+			const row = await db.prepare(sql).bind(...bindParams).first();
+			const rawCount = Math.max(0, Number(row?.total ?? row?.count) || 0);
+			return {
+				count: Math.min(D1_TIDY_PREVIEW_COUNT_LIMIT, rawCount),
+				countIsLowerBound: rawCount >= D1_TIDY_PREVIEW_COUNT_LIMIT,
+				exceedsLimit: rawCount > D1_TIDY_PREVIEW_COUNT_LIMIT
+			};
+		},
 		buildContext(runtimeConfig = {}, options = {}) {
 			const mode = String(options.mode || "manual").trim().toLowerCase() === "scheduled" ? "scheduled" : "manual";
 			const maintenanceMode = normalizeTidyMaintenanceMode(options.maintenanceMode, mode);
@@ -23900,21 +24578,56 @@ function buildD1TidyPlanner() {
 			};
 		},
 		async readFacts(database, db, kv, context) {
+			const expiredLogs = await this.readBoundedCount(db, database.LOGS_TABLE, "timestamp < ?", [context.retentionCutoffMs]);
+			const preservedLogs = await this.readBoundedCount(db, database.LOGS_TABLE, "timestamp >= ?", [context.retentionCutoffMs]);
+			const expiredLocks = await this.readBoundedCount(db, database.SCHEDULED_LOCKS_TABLE, "expires_at <= ?", [context.nowTimestamp]);
+			const expiredFetchCache = await this.readBoundedCount(db, database.DNS_IP_POOL_FETCH_CACHE_TABLE, "expires_at <= ?", [context.nowTimestamp]);
+			const expiredProbeCache = await this.readBoundedCount(db, database.DNS_IP_PROBE_CACHE_TABLE, "expires_at <= ?", [context.nowTimestamp]);
+			const expiredAuthFailures = await this.readBoundedCount(db, database.AUTH_FAILURES_TABLE, "expires_at <= ?", [context.nowTimestamp]);
+			const expiredDashboardCache = await this.readBoundedCount(db, database.CF_DASH_CACHE_TABLE, "expires_at <= ?", [context.nowTimestamp]);
+			const expiredRuntimeCache = await this.readBoundedCount(db, database.CF_RUNTIME_CACHE_TABLE, "expires_at <= ?", [context.nowTimestamp]);
+			const statsHourly = await this.readBoundedCount(db, database.STATS_HOURLY_TABLE);
+			const statsRetentionBoundaryDate = buildOffsetClockParts(context.retentionCutoffMs, context.utcOffsetMinutes).dateKey;
+			const expiredStatsHourly = await this.readBoundedCount(db, database.STATS_HOURLY_TABLE, "bucket_date < ?", [statsRetentionBoundaryDate]);
+			const dnsIpPoolItems = await this.readBoundedCount(db, database.DNS_IP_POOL_ITEMS_TABLE);
+			const dnsIpPoolSources = await this.readBoundedCount(db, database.DNS_IP_POOL_SOURCES_TABLE);
+			const sysStatus = await this.readBoundedCount(db, database.SYS_STATUS_TABLE);
+			const logStatus = await database.getOpsStatusSection({ db, kv }, "log");
 			return {
-				deletedExpiredLogCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.LOGS_TABLE} WHERE timestamp < ?`, [context.retentionCutoffMs]),
-				preservedLogCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.LOGS_TABLE} WHERE timestamp >= ?`, [context.retentionCutoffMs]),
-				deletedExpiredLockCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.SCHEDULED_LOCKS_TABLE} WHERE expires_at <= ?`, [context.nowTimestamp]),
-				deletedExpiredFetchCacheCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.DNS_IP_POOL_FETCH_CACHE_TABLE} WHERE expires_at <= ?`, [context.nowTimestamp]),
-				deletedExpiredProbeCacheCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.DNS_IP_PROBE_CACHE_TABLE} WHERE expires_at <= ?`, [context.nowTimestamp]),
-				deletedExpiredAuthFailureCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.AUTH_FAILURES_TABLE} WHERE expires_at <= ?`, [context.nowTimestamp]),
-				deletedExpiredDashboardCacheCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.CF_DASH_CACHE_TABLE} WHERE expires_at <= ?`, [context.nowTimestamp]),
-				deletedExpiredRuntimeCacheCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.CF_RUNTIME_CACHE_TABLE} WHERE expires_at <= ?`, [context.nowTimestamp]),
-				statsHourlyRowCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.STATS_HOURLY_TABLE}`),
-				dnsIpPoolItemCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.DNS_IP_POOL_ITEMS_TABLE}`),
-				dnsIpPoolSourceCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.DNS_IP_POOL_SOURCES_TABLE}`),
-				sysStatusCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.SYS_STATUS_TABLE}`),
-				ftsReady: await database.isLogsFtsReady(db),
-				d1DnsIpPoolSources: await database.getDnsIpPoolSourcesFromDb(db),
+				deletedExpiredLogCount: expiredLogs.count,
+				preservedLogCount: preservedLogs.count,
+				preservedLogCountExceedsLimit: preservedLogs.exceedsLimit,
+				deletedExpiredLockCount: expiredLocks.count,
+				deletedExpiredFetchCacheCount: expiredFetchCache.count,
+				deletedExpiredProbeCacheCount: expiredProbeCache.count,
+				deletedExpiredAuthFailureCount: expiredAuthFailures.count,
+				deletedExpiredDashboardCacheCount: expiredDashboardCache.count,
+				deletedExpiredRuntimeCacheCount: expiredRuntimeCache.count,
+				deletedExpiredStatsHourlyCount: expiredStatsHourly.count,
+				statsRetentionBoundaryDate,
+				statsHourlyRowCount: statsHourly.count,
+				dnsIpPoolItemCount: dnsIpPoolItems.count,
+				dnsIpPoolSourceCount: dnsIpPoolSources.count,
+				sysStatusCount: sysStatus.count,
+				statsUtcOffsetMinutes: database.getStatsUtcOffsetMinutesFromStatus(logStatus),
+				countLowerBounds: {
+					proxy_logs: expiredLogs.countIsLowerBound,
+					proxy_logs_retained: preservedLogs.countIsLowerBound,
+					proxy_logs_fts: preservedLogs.countIsLowerBound,
+					sys_locks: expiredLocks.countIsLowerBound,
+					dns_ip_pool_fetch_cache: expiredFetchCache.countIsLowerBound,
+					dns_ip_probe_cache: expiredProbeCache.countIsLowerBound,
+					auth_failures: expiredAuthFailures.countIsLowerBound,
+					cf_dashboard_cache: expiredDashboardCache.countIsLowerBound,
+					cf_runtime_cache: expiredRuntimeCache.countIsLowerBound,
+					proxy_stats_hourly: statsHourly.countIsLowerBound || expiredStatsHourly.countIsLowerBound,
+					dns_ip_pool_items: dnsIpPoolItems.countIsLowerBound,
+					sys_status: sysStatus.countIsLowerBound
+				},
+				ftsReady: context.schemaStatus?.schemaReady === true || await database.isLogsFtsReady(db),
+				d1DnsIpPoolSources: await database.getDnsIpPoolSourcesFromDb(db, {
+					schemaReady: context.schemaStatus?.schemaReady === true
+				}),
 				kvDnsIpPoolSources: []
 			};
 		},
@@ -23927,10 +24640,12 @@ function buildD1TidyPlanner() {
 		buildFlags(database, context, facts, sourcePolicy) {
 			const hasExpiredLogs = facts.deletedExpiredLogCount > 0;
 			const fullMaintenance = isFullTidyMaintenanceMode(context.maintenanceMode, context.mode);
-			const shouldRebuildLogsFts = fullMaintenance || !facts.ftsReady || hasExpiredLogs && database.shouldRunLogsFtsRebuild(context.lastFtsRebuildAt, { nowMs: context.nowTimestamp });
+			const ftsIntervalReady = database.shouldRunLogsFtsRebuild(context.lastFtsRebuildAt, { nowMs: context.nowTimestamp });
+			const ftsCandidate = (!facts.ftsReady || fullMaintenance || hasExpiredLogs) && ftsIntervalReady;
+			const ftsSizeGuarded = facts.preservedLogCount > D1_TIDY_FTS_REBUILD_LOG_LIMIT || facts.preservedLogCountExceedsLimit === true;
+			const shouldRebuildLogsFts = ftsCandidate && !ftsSizeGuarded;
 			const shouldOptimizeDb = fullMaintenance ? true : hasExpiredLogs && database.shouldRunLogsOptimize(context.lastOptimizeAt, { nowMs: context.nowTimestamp });
-			const shouldRunScheduledStatsMaintenance = context.mode === "scheduled" && hasExpiredLogs;
-			const shouldRebuildStatsHourly = fullMaintenance || hasExpiredLogs;
+			const shouldResetStatsHourly = fullMaintenance || facts.statsUtcOffsetMinutes !== context.utcOffsetMinutes;
 			return {
 				deleteExpiredLogs: hasExpiredLogs,
 				deleteExpiredLocks: facts.deletedExpiredLockCount > 0,
@@ -23939,14 +24654,16 @@ function buildD1TidyPlanner() {
 				deleteExpiredAuthFailures: facts.deletedExpiredAuthFailureCount > 0,
 				deleteExpiredDashboardCache: facts.deletedExpiredDashboardCacheCount > 0,
 				deleteExpiredRuntimeCache: facts.deletedExpiredRuntimeCacheCount > 0,
-				rebuildStatsHourly: shouldRebuildStatsHourly,
+				deleteExpiredStatsHourly: facts.deletedExpiredStatsHourlyCount > 0,
+				rebuildStatsHourly: shouldResetStatsHourly,
 				rebuildLogsFts: shouldRebuildLogsFts,
-				rebuildLogsFtsDeferred: context.mode === "scheduled" && hasExpiredLogs && facts.ftsReady && shouldRebuildLogsFts !== true,
+				rebuildLogsFtsDeferred: ftsCandidate && !shouldRebuildLogsFts,
+				ftsRebuildDeferredReason: ftsSizeGuarded ? "deferred_size_guard" : "",
 				rebuildLogsFtsForceRecreate: false,
 				optimizeDb: shouldOptimizeDb,
 				optimizeDbDeferred: context.mode === "scheduled" && hasExpiredLogs && shouldOptimizeDb !== true,
-				alignStatsWindow: shouldRunScheduledStatsMaintenance,
-				rebuildDailyStats: shouldRunScheduledStatsMaintenance,
+				alignStatsWindow: shouldResetStatsHourly,
+				rebuildDailyStats: false,
 				processDnsIpPoolSources: false
 			};
 		},
@@ -23959,14 +24676,16 @@ function buildD1TidyPlanner() {
 			pushTidyPreviewGroup(deleteGroups, facts.deletedExpiredProbeCacheCount > 0, "dns_ip_probe_cache", "过期 dns_ip_probe_cache 探测缓存", [], facts.deletedExpiredProbeCacheCount, "只会删除 expires_at 已过期的探测缓存。");
 			pushTidyPreviewGroup(deleteGroups, facts.deletedExpiredAuthFailureCount > 0, "auth_failures", "过期 auth_failures 登录失败计数", [], facts.deletedExpiredAuthFailureCount, "只会删除 expires_at 已过期的登录失败计数。");
 			pushTidyPreviewGroup(deleteGroups, facts.deletedExpiredDashboardCacheCount > 0, "cf_dashboard_cache", "过期 cf_dashboard_cache 仪表盘缓存", [], facts.deletedExpiredDashboardCacheCount, "只会删除 expires_at 已过期的仪表盘缓存。");
+			pushTidyPreviewGroup(deleteGroups, facts.deletedExpiredRuntimeCacheCount > 0, "cf_runtime_cache", "过期 cf_runtime_cache 运行缓存", [], facts.deletedExpiredRuntimeCacheCount, "只会删除 expires_at 已过期的运行缓存。");
+			pushTidyPreviewGroup(deleteGroups, facts.deletedExpiredStatsHourlyCount > 0, "proxy_stats_hourly_expired", "过期 proxy_stats_hourly 日期桶", [], facts.deletedExpiredStatsHourlyCount, `只删除早于边界日 ${facts.statsRetentionBoundaryDate} 的统计桶。`);
 			const rewriteGroups = [
 				createTidyPreviewGroup("proxy_stats_hourly", "proxy_stats_hourly 统计表", [], {
 					count: Math.max(1, facts.statsHourlyRowCount),
-					note: context.maintenanceMode === "full" ? `会按保留期内日志全量重建小时统计（当前行数 ${facts.statsHourlyRowCount}）。` : `会在必要时对齐小时统计（当前行数 ${facts.statsHourlyRowCount}）。`
+					note: flags.rebuildStatsHourly ? `会清空当前统计（当前行数 ${facts.statsHourlyRowCount}），并从后续新日志重新累计，不扫描历史日志。` : `保留当前统计，仅分页删除保留期边界前的日期桶（当前行数 ${facts.statsHourlyRowCount}）。`
 				}),
 				createTidyPreviewGroup("proxy_logs_fts", "proxy_logs_fts 全文索引", [], {
 					count: Math.max(1, facts.preservedLogCount),
-					note: facts.ftsReady ? context.maintenanceMode === "full" ? "会基于当前保留日志重建全文索引。" : "会在必要时重建全文索引。" : "当前未检测到 FTS 表，整理时会按策略补建并重建全文索引。"
+					note: flags.ftsRebuildDeferredReason === "deferred_size_guard" ? "基础日志超过 10000 行，本轮不会自动 rebuild。" : facts.ftsReady ? "仅在无清理积压、预算有余量且满足最小间隔时重建。" : "当前未检测到 FTS 表，整理时会按资源预算决定是否补建。"
 				}),
 				createTidyPreviewGroup("scheduled_d1_tidy", "scheduled.d1Tidy 运行状态", ["scheduled.d1Tidy"], {
 					count: 1,
@@ -23988,10 +24707,15 @@ function buildD1TidyPlanner() {
 				})
 			];
 			pushTidyPreviewGroup(preserveGroups, facts.d1DnsIpPoolSources.length > 0, "dns_ip_pool_sources_d1_primary", "dns_ip_pool_sources 主数据", d1SourceNames, facts.d1DnsIpPoolSources.length, "dns_ip_pool_sources 现在是正式主数据，本次不会迁回 KV，也不会清空该表。");
+			const lowerBoundAliases = { proxy_stats_hourly_expired: "proxy_stats_hourly" };
+			for (const group of [...deleteGroups, ...rewriteGroups, ...preserveGroups]) {
+				const countKey = lowerBoundAliases[group.key] || group.key;
+				if (facts.countLowerBounds?.[countKey] === true) group.countIsLowerBound = true;
+			}
 			const warnings = [];
 			const logQueuePendingCount = Math.max(0, Number(context.logQueuePendingCount) || 0);
 			if (logQueuePendingCount > 0) warnings.push(`执行前会先尝试 flush ${logQueuePendingCount} 条内存日志，再开始清理 D1。`);
-			warnings.push(context.maintenanceMode === "full" ? "当前为 full 维护模式，会强制执行统计、FTS 与 optimize。" : "当前为 smart 维护模式，只在检测到必要条件时执行较重的统计、FTS 与 optimize。");
+			warnings.push(context.maintenanceMode === "full" ? "当前为 full 维护模式；统计会清空后重新累计，FTS 与 optimize 仍受大小、积压、间隔和时间预算约束。" : "当前为 smart 维护模式，只在检测到必要条件且预算允许时执行较重的统计、FTS 与 optimize。");
 			if (deleteGroups.length === 0) warnings.push(context.mode === "scheduled" ? "当前定时 D1 维护没有检测到需要删除的旧数据，本轮会按计划检查统计与索引维护。" : "当前没有检测到需要删除的 D1 旧数据；本次主要会执行统计表与 FTS 维护。");
 			return {
 				scope: "d1",
@@ -24016,6 +24740,7 @@ function buildD1TidyPlanner() {
 				deletedExpiredAuthFailureCount: facts.deletedExpiredAuthFailureCount,
 				deletedExpiredDashboardCacheCount: facts.deletedExpiredDashboardCacheCount,
 				deletedExpiredRuntimeCacheCount: facts.deletedExpiredRuntimeCacheCount,
+				deletedExpiredStatsHourlyCount: facts.deletedExpiredStatsHourlyCount,
 				rebuiltStatsHourly: flags.rebuildStatsHourly === true,
 				rebuiltLogsFts: flags.rebuildLogsFts === true,
 				alignedStatsWindow: flags.alignStatsWindow === true,
@@ -24052,6 +24777,7 @@ var DATA_SERVICE_CONSTANTS = Object.freeze({
 	DNS_RECORD_HISTORY_PREFIX: "sys:dns_record_history:v1:",
 	LEGACY_TELEGRAM_ALERT_STATE_KEY: "sys:telegram_alert_state:v1",
 	SYS_STATUS_TABLE: "sys_status",
+	D1_SCHEMA_META_TABLE: "d1_schema_meta",
 	SCHEDULED_LOCKS_TABLE: "sys_locks",
 	SCHEDULED_LOCK_SCOPE: "scheduled",
 	LOGS_TABLE: "proxy_logs",
@@ -24131,7 +24857,7 @@ function buildCacheServices(dependencies = {}) {
 				monthlyTraffic: null
 			});
 			const start = now;
-			const cleanMap = (map, shouldDelete, iteratorKey, iteratorStore = iterators) => {
+			const cleanMap = (map, shouldDelete, iteratorKey, iteratorStore = iterators, deleteEntry = (key) => map.delete(key)) => {
 				let iterator = iteratorStore[iteratorKey];
 				if (!iterator) {
 					iterator = map.entries();
@@ -24147,7 +24873,7 @@ function buildCacheServices(dependencies = {}) {
 					scanned += 1;
 					const [k, v] = next.value;
 					if (!map.has(k)) continue;
-					if (shouldDelete(v, now)) map.delete(k);
+					if (shouldDelete(v, now)) deleteEntry(k);
 				}
 			};
 			if (state.phase === 0) {
@@ -24189,7 +24915,7 @@ function buildCacheServices(dependencies = {}) {
 					if (terminalUntil > 0) return terminalUntil < now;
 					const touchedAt = Number(v.lastTouchedAt || v.lastForwardAt) || 0;
 					return touchedAt > 0 && touchedAt + staleWindowMs <= now;
-				}, "progress");
+				}, "progress", iterators, deletePlaybackProgressRelayEntry);
 				state.phase = 8;
 			} else {
 				cleanMap(cacheState.DashboardMonthlyTrafficCache, (v) => !v || (Number(v.staleUntil) || 0) <= now, "monthlyTraffic");
@@ -24210,7 +24936,7 @@ function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 			if (!isPlainObject(rawNode)) return null;
 			const name = String(nodeName || rawNode.name || "").toLowerCase().trim();
 			if (!name) return null;
-			const normalizedLines = kernel.normalizeLines(rawNode.lines, rawNode.target, rawNode.port);
+			const normalizedLines = kernel.normalizeLines(rawNode.lines, rawNode.target, rawNode.port).slice(0, NODE_LINE_MAX);
 			if (!normalizedLines.length) return null;
 			const activeLineId = kernel.resolveActiveLineId(rawNode.activeLineId, normalizedLines, Array.isArray(rawNode.lines) ? rawNode.lines : [], rawNode.port);
 			const entryMode = normalizeNodeEntryMode(rawNode.entryMode);
@@ -24454,7 +25180,7 @@ function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 					const stored = await kv.get(`${kernel.PREFIX}${name}`, { type: "json" });
 					if (!stored) return null;
 					const normalizedNode = kernel.normalizeNode(name, stored);
-					if (normalizedNode.changed) {
+					if (normalizedNode.changed && !getNodeResourceLimitViolation(name, normalizedNode.data)) {
 						const task = kv.put(`${kernel.PREFIX}${name}`, JSON.stringify(normalizedNode.data));
 						if (ctx) ctx.waitUntil(task);
 						else await task;
@@ -24523,6 +25249,7 @@ function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 			if (!kv) return null;
 			const name = String(nodeName || "").toLowerCase().trim();
 			if (!name) return null;
+			if (getNodeResourceLimitViolation(name, nodeData)) return null;
 			const normalizedNode = kernel.buildNodeSummary(name, nodeData).summary;
 			if (!normalizedNode) return null;
 			const state = getNodeBindingCacheState(kv);
@@ -24591,6 +25318,7 @@ function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 		buildPlaybackRouteHotSnapshot(nodeName, nodeData = {}, options = {}) {
 			const name = String(nodeName || "").toLowerCase().trim();
 			if (!name || !isPlainObject(nodeData)) return null;
+			if (getNodeResourceLimitViolation(name, nodeData)) return null;
 			const orderedLines = kernel.getOrderedNodeLines(nodeData);
 			const targetRecords = (orderedLines.length ? orderedLines.map((line) => line?.target) : String(nodeData.target || "").split(",").map((item) => item.trim()).filter(Boolean)).map((item) => createTargetRecord(item)).filter(isTargetRecord);
 			if (!targetRecords.length) return null;
@@ -25311,6 +26039,7 @@ function defineNodeKvTidyMethods(dependencies = {}, kernel = {}) {
 					name: nodeName,
 					...normalizedNode
 				});
+				if (getNodeResourceLimitViolation(nodeName, normalizedNode)) continue;
 				if (!changed) continue;
 				nodeRollbackEntries.push({
 					key,
@@ -25340,29 +26069,9 @@ function defineNodeKvTidyMethods(dependencies = {}, kernel = {}) {
 				rollbackKvEntries: [...rollbackKvEntries, ...nodeRollbackEntries]
 			};
 		},
-		rewriteKvTidySnapshots(rawSnapshots = []) {
-			const rewrittenSnapshots = [];
-			let rewrittenSnapshotCount = 0;
-			let deletedLegacySnapshotFieldCount = 0;
-			const migratedConfigKeys = [];
-			for (const snapshot of rawSnapshots) {
-				const rewriteResult = rewriteConfigSnapshotToCurrentSchema(snapshot);
-				rewrittenSnapshots.push(redactConfigSnapshotSecrets(rewriteResult.snapshot));
-				if (rewriteResult.rewritten) rewrittenSnapshotCount += 1;
-				deletedLegacySnapshotFieldCount += Number(rewriteResult.deletedLegacyFieldCount) || 0;
-				migratedConfigKeys.push(...rewriteResult.migratedConfigKeys || []);
-			}
-			return {
-				rewrittenSnapshots,
-				rewrittenSnapshotCount,
-				deletedLegacySnapshotFieldCount,
-				migratedConfigKeys
-			};
-		},
 		buildKvTidyNoteParts(payload = {}, options = {}) {
 			const noteParts = [];
 			if (Array.isArray(payload.legacyKeysPresent) && payload.legacyKeysPresent.length) noteParts.push(`legacy_keys=${payload.legacyKeysPresent.join(",")}`);
-			if (Number(payload.rewrittenSnapshotCount) > 0) noteParts.push(`rewritten_snapshots=${payload.rewrittenSnapshotCount}`);
 			if (Number(payload.rewrittenNodeCount) > 0) noteParts.push(`rewritten_nodes=${payload.rewrittenNodeCount}`);
 			if (Number(payload.migratedTopLevelPortNodeCount) > 0) noteParts.push(`top_level_port_nodes=${payload.migratedTopLevelPortNodeCount}`);
 			if (Number(payload.migratedLinePortCount) > 0) noteParts.push(`line_ports=${payload.migratedLinePortCount}`);
@@ -25371,29 +26080,11 @@ function defineNodeKvTidyMethods(dependencies = {}, kernel = {}) {
 			if (options.includeRepairSource === true && options.repairedConfig?.hadMalformedValue) noteParts.push(`${options.repairLabel || "config_source"}=${options.repairedConfig.source}`);
 			return noteParts;
 		},
-		normalizeKvTidyMutationValueForHash(mutation = {}) {
-			const key = String(mutation?.key || "").trim();
-			const value = String(mutation?.value ?? "");
-			if (key !== kernel.CONFIG_SNAPSHOTS_KEY || !value) return value;
-			try {
-				const snapshots = JSON.parse(value);
-				if (!Array.isArray(snapshots)) return value;
-				return JSON.stringify(snapshots.map((snapshot) => {
-					if (!isPlainObject(snapshot)) return snapshot;
-					const normalized = { ...snapshot };
-					delete normalized.id;
-					delete normalized.createdAt;
-					return normalized;
-				}));
-			} catch {
-				return value;
-			}
-		},
 		buildKvTidyPlanHash(plan = {}) {
 			const mutationPlan = (Array.isArray(plan?.mutationPlan) ? plan.mutationPlan : []).map((mutation) => ({
 				type: String(mutation?.type || "put").trim().toLowerCase() === "delete" ? "delete" : "put",
 				key: String(mutation?.key || "").trim(),
-				value: kernel.normalizeKvTidyMutationValueForHash(mutation)
+				value: String(mutation?.value ?? "")
 			}));
 			return hashStableText(serializeConfigValue({
 				scope: "kv",
@@ -25496,9 +26187,11 @@ var NodeProxyFacade = class {
 				if (!routeContext.root) return null;
 				const playbackHotEligible = this.#isPlaybackCriticalRouteContext(routeContext);
 				let playbackRouteHotSnapshot = playbackHotEligible ? await this.nodeRouteReader.getVerifiedPlaybackRouteHotSnapshot(routeContext.root, env) : null;
-				const targetHotCacheState = playbackHotEligible ? playbackRouteHotSnapshot ? "hit" : "miss" : "skip";
+				let targetHotCacheState = playbackHotEligible ? playbackRouteHotSnapshot ? "hit" : "miss" : "skip";
 				const nodeData = playbackRouteHotSnapshot?.nodeData || await this.nodeRouteReader.getNode(routeContext.root, env, ctx);
 				if (!nodeData) return null;
+				const nodeCacheState = getNodeResourceLimitViolation(routeContext.root, nodeData) ? "oversized_bypass" : "";
+				if (nodeCacheState) targetHotCacheState = nodeCacheState;
 				if (isHostPrefixEntryMode(nodeData?.entryMode)) return null;
 				const secret = nodeData.secret;
 				const routePrefix = buildProxyPrefix(routeContext.root, secret);
@@ -25534,6 +26227,7 @@ var NodeProxyFacade = class {
 					pathNormalizationState,
 					playbackRouteHotSnapshot,
 					targetHotCacheState,
+					nodeCacheState,
 					entryMode: "kv_route"
 				};
 			}
@@ -25549,9 +26243,11 @@ var NodeProxyFacade = class {
 				const nodeName = hostPrefixMatch.prefix;
 				const playbackHotEligible = this.#isHostPrefixPlaybackCriticalRouteContext(routeContext);
 				let playbackRouteHotSnapshot = playbackHotEligible ? await this.nodeRouteReader.getVerifiedPlaybackRouteHotSnapshot(nodeName, env) : null;
-				const targetHotCacheState = playbackHotEligible ? playbackRouteHotSnapshot ? "hit" : "miss" : "skip";
+				let targetHotCacheState = playbackHotEligible ? playbackRouteHotSnapshot ? "hit" : "miss" : "skip";
 				const nodeData = playbackRouteHotSnapshot?.nodeData || await this.nodeRouteReader.getNode(nodeName, env, ctx);
 				if (!nodeData || !isHostPrefixEntryMode(nodeData?.entryMode)) return null;
+				const nodeCacheState = getNodeResourceLimitViolation(nodeName, nodeData) ? "oversized_bypass" : "";
+				if (nodeCacheState) targetHotCacheState = nodeCacheState;
 				const linkVariantState = consumeProxyLinkVariantPrefix(routeContext.normalizedPathname);
 				let remaining = linkVariantState.remaining;
 				if (linkVariantState.needsTrailingSlashRedirect === true) return { response: this.#buildTrailingSlashRedirectResponse(request, routeContext.normalizedPathname) };
@@ -25565,6 +26261,7 @@ var NodeProxyFacade = class {
 					requestUrl: routeContext.requestUrl,
 					playbackRouteHotSnapshot,
 					targetHotCacheState,
+					nodeCacheState,
 					entryMode: "host_prefix"
 				};
 			}
@@ -25583,9 +26280,11 @@ var NodeProxyFacade = class {
 				const nodeName = routeContext.root;
 				const playbackHotEligible = this.#isPlaybackCriticalRouteContext(routeContext);
 				let playbackRouteHotSnapshot = playbackHotEligible ? await this.nodeRouteReader.getVerifiedPlaybackRouteHotSnapshot(nodeName, env) : null;
-				const targetHotCacheState = playbackHotEligible ? playbackRouteHotSnapshot ? "hit" : "miss" : "skip";
+				let targetHotCacheState = playbackHotEligible ? playbackRouteHotSnapshot ? "hit" : "miss" : "skip";
 				const nodeData = playbackRouteHotSnapshot?.nodeData || await this.nodeRouteReader.getNode(nodeName, env, ctx);
 				if (!nodeData || !isHostPrefixEntryMode(nodeData?.entryMode)) return null;
+				const nodeCacheState = getNodeResourceLimitViolation(nodeName, nodeData) ? "oversized_bypass" : "";
+				if (nodeCacheState) targetHotCacheState = nodeCacheState;
 				const routePrefix = buildProxyPrefix(nodeName, "", { entryMode: "kv_route" });
 				const rootPrefixLen = 1 + routeContext.rootRaw.length;
 				const rawPathAfterRoot = routeContext.normalizedPathname.substring(rootPrefixLen);
@@ -25613,6 +26312,7 @@ var NodeProxyFacade = class {
 					pathNormalizationState,
 					playbackRouteHotSnapshot,
 					targetHotCacheState,
+					nodeCacheState,
 					entryMode: "kv_route",
 					routeKindOverride: options.isLegacyHostRequest === true ? "legacy_host_prefix_path_compat" : "host_prefix_path_compat",
 					attachLegacyProxyContext: options.isLegacyHostRequest === true
@@ -25630,9 +26330,11 @@ var NodeProxyFacade = class {
 				if (!nodeName) return { response: this.#buildLegacyProxyContextNotFoundResponse(request, env) };
 				const playbackHotEligible = isPlaybackCriticalProxyPath(routeContext.normalizedPathname);
 				let playbackRouteHotSnapshot = playbackHotEligible ? await this.nodeRouteReader.getVerifiedPlaybackRouteHotSnapshot(nodeName, env) : null;
-				const targetHotCacheState = playbackHotEligible ? playbackRouteHotSnapshot ? "hit" : "miss" : "skip";
+				let targetHotCacheState = playbackHotEligible ? playbackRouteHotSnapshot ? "hit" : "miss" : "skip";
 				const nodeData = playbackRouteHotSnapshot?.nodeData || await this.nodeRouteReader.getNode(nodeName, env, ctx);
 				if (!nodeData) return { response: this.#buildLegacyProxyContextNotFoundResponse(request, env) };
+				const nodeCacheState = getNodeResourceLimitViolation(nodeName, nodeData) ? "oversized_bypass" : "";
+				if (nodeCacheState) targetHotCacheState = nodeCacheState;
 				const hostPrefixCompat = isHostPrefixEntryMode(nodeData?.entryMode);
 				if (playbackHotEligible && !playbackRouteHotSnapshot) playbackRouteHotSnapshot = await this.nodeRouteReader.primePlaybackRouteHotSnapshot(nodeName, nodeData, env);
 				return {
@@ -25644,6 +26346,7 @@ var NodeProxyFacade = class {
 					requestUrl: routeContext.requestUrl,
 					playbackRouteHotSnapshot,
 					targetHotCacheState,
+					nodeCacheState,
 					entryMode: "kv_route",
 					routeKindOverride: hostPrefixCompat ? "legacy_host_context_cookie_host_prefix_compat" : "legacy_host_context_cookie"
 				};
@@ -25664,6 +26367,7 @@ var NodeProxyFacade = class {
 						requestUrl: hostPrefixRoute.requestUrl || routeContext.requestUrl,
 						linkVariant: hostPrefixRoute.linkVariant,
 						targetHotCacheState: hostPrefixRoute.targetHotCacheState,
+						nodeCacheState: hostPrefixRoute.nodeCacheState,
 						cachedTargetRecords: Array.isArray(hostPrefixRoute.playbackRouteHotSnapshot?.targetRecords) ? hostPrefixRoute.playbackRouteHotSnapshot.targetRecords : null,
 						nodeCacheRevision: hostPrefixRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
 						runtimeConfig,
@@ -25681,6 +26385,7 @@ var NodeProxyFacade = class {
 						linkVariant: hostPrefixCompatRoute.linkVariant,
 						pathNormalizationState: hostPrefixCompatRoute.pathNormalizationState,
 						targetHotCacheState: hostPrefixCompatRoute.targetHotCacheState,
+						nodeCacheState: hostPrefixCompatRoute.nodeCacheState,
 						cachedTargetRecords: Array.isArray(hostPrefixCompatRoute.playbackRouteHotSnapshot?.targetRecords) ? hostPrefixCompatRoute.playbackRouteHotSnapshot.targetRecords : null,
 						nodeCacheRevision: hostPrefixCompatRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
 						runtimeConfig,
@@ -25698,6 +26403,7 @@ var NodeProxyFacade = class {
 						linkVariant: proxyRoute.linkVariant,
 						pathNormalizationState: proxyRoute.pathNormalizationState,
 						targetHotCacheState: proxyRoute.targetHotCacheState,
+						nodeCacheState: proxyRoute.nodeCacheState,
 						cachedTargetRecords: Array.isArray(proxyRoute.playbackRouteHotSnapshot?.targetRecords) ? proxyRoute.playbackRouteHotSnapshot.targetRecords : null,
 						nodeCacheRevision: proxyRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
 						runtimeConfig,
@@ -25714,6 +26420,7 @@ var NodeProxyFacade = class {
 							requestUrl: legacyCookieRoute.requestUrl || routeContext.requestUrl,
 							linkVariant: legacyCookieRoute.linkVariant,
 							targetHotCacheState: legacyCookieRoute.targetHotCacheState,
+							nodeCacheState: legacyCookieRoute.nodeCacheState,
 							cachedTargetRecords: Array.isArray(legacyCookieRoute.playbackRouteHotSnapshot?.targetRecords) ? legacyCookieRoute.playbackRouteHotSnapshot.targetRecords : null,
 							nodeCacheRevision: legacyCookieRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
 							runtimeConfig,

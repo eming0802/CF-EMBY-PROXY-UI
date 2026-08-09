@@ -79,10 +79,31 @@ const MAIN_VIDEO_STREAM_MODE_OPTIONS = [
   { value: 'direct', label: 'direct' }
 ];
 
+const NODE_GET_PROBE_CONCURRENCY = 4;
+
+async function runWithConcurrency(items = [], concurrency = 1, task = null) {
+  const entries = Array.isArray(items) ? items : [];
+  if (!entries.length || typeof task !== 'function') return;
+  const workerCount = Math.min(
+    entries.length,
+    Math.max(1, Math.floor(Number(concurrency) || 1))
+  );
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < entries.length) {
+      const index = cursor;
+      cursor += 1;
+      await task(entries[index], index);
+    }
+  };
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+}
+
 let editorRequestId = 0;
 let lineDraftSequence = 0;
 
 const query = ref('');
+const globalHeadProbePending = ref(false);
 const feedback = reactive({
   tone: '',
   text: ''
@@ -138,6 +159,12 @@ const multiLinkCopyPanelEnabled = computed(() => {
   const settingsConfig = props.adminConsole?.settingsBootstrap?.config;
   const bootstrapConfig = props.adminConsole?.adminBootstrap?.config;
   return settingsConfig?.multiLinkCopyPanelEnabled === true || bootstrapConfig?.multiLinkCopyPanelEnabled === true;
+});
+const hostPrefixProxyEnabled = computed(() => {
+  const settingsConfig = props.adminConsole?.settingsBootstrap?.config;
+  const bootstrapConfig = props.adminConsole?.adminBootstrap?.config;
+  const config = settingsConfig && typeof settingsConfig === 'object' ? settingsConfig : bootstrapConfig;
+  return config?.enableHostPrefixProxy === true;
 });
 
 const filteredNodes = computed(() => {
@@ -260,6 +287,29 @@ async function handleRefresh() {
   await props.adminConsole?.hydrateNodes();
 }
 
+async function handleGlobalHeadProbe() {
+  if (!props.adminConsole || globalHeadProbePending.value) return;
+  const currentNodes = nodes.value.slice();
+  if (!currentNodes.length) return;
+
+  globalHeadProbePending.value = true;
+  feedback.tone = '';
+  feedback.text = '';
+  let successCount = 0;
+  try {
+    await runWithConcurrency(currentNodes, NODE_GET_PROBE_CONCURRENCY, async (node) => {
+      const result = await props.adminConsole.pingNode({
+        name: String(node?.name || '').trim()
+      });
+      if (result?.probe?.ok === true) successCount += 1;
+    });
+    feedback.tone = successCount === currentNodes.length ? 'success' : 'warning';
+    feedback.text = `全局 GET 测试完成：${successCount}/${currentNodes.length} 个节点成功。`;
+  } finally {
+    globalHeadProbePending.value = false;
+  }
+}
+
 function handleOpenImport() {
   feedback.tone = '';
   feedback.text = '';
@@ -328,6 +378,9 @@ async function handleOpenEdit(node) {
     editor.baseline = serializeNodeForm(form);
   }
 
+  const resourceWarning = formatNodeResourceWarning(result);
+  if (resourceWarning) setEditorAction('warning', resourceWarning);
+
   editor.loadingPrefill = false;
 }
 
@@ -351,6 +404,16 @@ function setEditorAction(tone = '', text = '') {
   editorRuntime.actionText = String(text || '').trim();
 }
 
+function formatNodeResourceWarning(result = {}) {
+  const warning = Array.isArray(result?.warnings)
+    ? result.warnings.find((item) => item?.code === 'NODE_RESOURCE_LIMIT_EXCEEDED')
+    : null;
+  if (!warning) return '';
+  const actual = warning.actual == null ? '?' : String(warning.actual);
+  const limit = warning.limit == null ? '?' : String(warning.limit);
+  return `该旧节点超过 Worker 资源限制（${String(warning.field || 'record')}: ${actual}/${limit}），仍可读取和代理，但不会进入内存缓存或自动回写。`;
+}
+
 async function handleRefreshEditorDetail() {
   if (!props.adminConsole || !editorCanOperateSavedNode.value || editor.loadingPrefill || editorRuntime.refreshingDetail) return;
 
@@ -362,15 +425,16 @@ async function handleRefreshEditorDetail() {
   if (!result?.node) return;
 
   editorRuntime.detailNode = cloneNodeRuntimeState(result.node);
+  const resourceWarning = formatNodeResourceWarning(result);
   if (!hasEditorChanges.value) {
     hydrateNodeForm(buildNodeFormFromNode(result.node));
     editor.baseline = serializeNodeForm(form);
-    setEditorAction('success', `已重新读取 Worker 中 ${resolveDisplayName(result.node)} 的最新详情。`);
+    setEditorAction(resourceWarning ? 'warning' : 'success', resourceWarning || `已重新读取 Worker 中 ${resolveDisplayName(result.node)} 的最新详情。`);
     return;
   }
 
   mergeLineDiagnosticsIntoDrafts(result.node);
-  setEditorAction('success', `已刷新 Worker 中 ${resolveDisplayName(result.node)} 的诊断信息，当前草稿修改已保留。`);
+  setEditorAction(resourceWarning ? 'warning' : 'success', resourceWarning || `已刷新 Worker 中 ${resolveDisplayName(result.node)} 的诊断信息，当前草稿修改已保留。`);
 }
 
 async function handlePingEditorSavedNode(line = null, options = {}) {
@@ -621,9 +685,9 @@ async function handlePing(node, line = null, options = {}) {
     : activeLine;
   const displayName = resolveDisplayName(result.node || node);
   const successText = matchedLine
-    ? `节点 ${displayName} 的线路 ${resolveLineLabel(matchedLine)} 探测完成，延迟 ${formatLatency(matchedLine.latencyMs)}。`
+    ? `节点 ${displayName} 的线路 ${resolveLineLabel(matchedLine)} 探测完成，结果 ${formatLineProbe(matchedLine)}。`
     : activeLine
-      ? `节点 ${displayName} 探测完成，当前线路 ${resolveLineLabel(activeLine)}，延迟 ${formatLatency(activeLine.latencyMs)}。`
+      ? `节点 ${displayName} 探测完成，当前线路 ${resolveLineLabel(activeLine)}，结果 ${formatLineProbe(activeLine)}。`
       : `节点 ${displayName} 探测完成。`;
 
   feedback.tone = 'success';
@@ -835,6 +899,7 @@ function createEmptyLineDraft(index = 0, source = {}) {
     target: String(source?.target || '').trim(),
     latencyMs: normalizeLatencyNumber(source?.latencyMs),
     latencyUpdatedAt: String(source?.latencyUpdatedAt || '').trim(),
+    probe: isPlainObject(source?.probe) ? { ...source.probe } : null,
     probeStatus: String(source?.probeStatus || source?.status || source?.healthStatus || source?.healthState || '').trim(),
     remark: String(source?.remark || '').trim()
   };
@@ -947,6 +1012,7 @@ function mergeLineDiagnosticsIntoDrafts(node = {}) {
       savedId,
       latencyMs: normalizeLatencyNumber(runtimeLine?.latencyMs),
       latencyUpdatedAt: String(runtimeLine?.latencyUpdatedAt || '').trim(),
+      probe: isPlainObject(runtimeLine?.probe) ? { ...runtimeLine.probe } : null,
       probeStatus: String(runtimeLine?.probeStatus || runtimeLine?.status || runtimeLine?.healthStatus || runtimeLine?.healthState || '').trim(),
       remark: String(runtimeLine?.remark || line?.remark || '').trim()
     };
@@ -1156,6 +1222,23 @@ function normalizeEntryMode(value = '') {
   return String(value || '').trim().toLowerCase() === 'host_prefix' ? 'host_prefix' : 'kv_route';
 }
 
+function normalizeHostPrefixDnsHostname(value = '') {
+  const rawText = String(value || '').trim().toLowerCase();
+  if (!rawText) return '';
+  const text = rawText.endsWith('.') ? rawText.slice(0, -1) : rawText;
+  if (!text || text.length > 253 || text.endsWith('.')) return '';
+  if (/\s|[:\/@*?#\\]/.test(text)) return '';
+  if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(text)) {
+    const parts = text.split('.').map(Number);
+    if (parts.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)) return '';
+  }
+  const labels = text.split('.');
+  if (labels.some((label) => !label
+    || label.length > 63
+    || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))) return '';
+  return text;
+}
+
 function normalizeTagColor(value = '') {
   const normalized = String(value || '').trim().toLowerCase();
   return TAG_COLOR_OPTIONS.some((option) => option.value === normalized) ? normalized : '';
@@ -1253,6 +1336,7 @@ function normalizeDiagnosticKey(value = '') {
 }
 
 function normalizeLatencyNumber(value = null) {
+  if (value === null || value === undefined || String(value).trim() === '') return null;
   const ms = Number(value);
   return Number.isFinite(ms) ? Math.max(0, Math.round(ms)) : null;
 }
@@ -1358,6 +1442,18 @@ function resolveNodeHealthMeta(node = {}) {
 }
 
 function resolveLineProbeMeta(line = {}) {
+  if (isPlainObject(line?.probe)) {
+    const probe = normalizeLineProbe(line);
+    return {
+      key: probe.reason,
+      label: formatLineProbe(line),
+      tone: probe.ok
+        ? 'border-mint-400/30 bg-mint-400/12 text-mint-200'
+        : probe.reason === 'timeout'
+          ? 'border-amber-400/30 bg-amber-500/12 text-amber-200'
+          : 'border-rose-400/30 bg-rose-500/12 text-rose-100'
+    };
+  }
   const probeKey = normalizeDiagnosticKey(
     line?.probeStatus
     || line?.status
@@ -1483,11 +1579,19 @@ function buildNodeCopyEntries(node = {}) {
     });
   };
 
-  const primaryRouteHref = buildNodeRouteHref(nodeName, entryMode, hostDomain.value);
+  const hostPrefixActive = entryMode === 'host_prefix'
+    && hostPrefixProxyEnabled.value
+    && !!normalizeHostPrefixDnsHostname(hostDomain.value);
+  const primaryRouteHref = buildNodeRouteHref(
+    nodeName,
+    hostPrefixActive ? 'host_prefix' : 'kv_route',
+    hostDomain.value,
+    props.adminConsole?.apiBaseUrl
+  );
   if (primaryRouteHref) {
     pushEntry(
       `route-${nodeName}`,
-      entryMode === 'host_prefix' ? 'Host Prefix 入口' : '主域入口',
+      hostPrefixActive ? 'Host Prefix 入口' : '主域入口',
       primaryRouteHref,
       'route',
       hostDomain.value
@@ -1534,11 +1638,17 @@ function buildNodeCopyEntries(node = {}) {
   return entries;
 }
 
-function buildNodeRouteHref(nodeName = '', entryMode = 'kv_route', routeHost = '') {
-  const host = String(routeHost || '').trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
-  if (!host || !nodeName) return '';
-  if (normalizeEntryMode(entryMode) === 'host_prefix') return `https://${nodeName}.${host}`;
-  return `https://${host}/${nodeName}`;
+function buildNodeRouteHref(nodeName = '', entryMode = 'kv_route', routeHost = '', fallbackBaseUrl = '') {
+  const host = normalizeHostPrefixDnsHostname(routeHost);
+  if (!nodeName) return '';
+  if (normalizeEntryMode(entryMode) === 'host_prefix') return host ? `https://${nodeName}.${host}` : '';
+  if (host) return `https://${host}/${nodeName}`;
+  try {
+    const windowOrigin = typeof window === 'undefined' ? '' : window.location?.origin;
+    return `${new URL(String(fallbackBaseUrl || windowOrigin || '')).origin}/${nodeName}`;
+  } catch {
+    return '';
+  }
 }
 
 function canCopyNode(node = {}) {
@@ -1565,7 +1675,11 @@ function resolveTagTone(tagColor = '') {
   return toneMap[normalizedColor] || 'border-white/12 bg-white/8 text-slate-100';
 }
 
-function resolveLatencyTone(latencyMs) {
+function resolveLatencyTone(latencyMs, line = null) {
+  if (line?.probe?.ok === false) return 'border-rose-400/30 bg-rose-500/12 text-rose-200';
+  if (latencyMs === null || latencyMs === undefined || String(latencyMs).trim() === '') {
+    return 'border-white/12 bg-white/6 text-slate-200';
+  }
   const ms = Number(latencyMs);
   if (!Number.isFinite(ms)) return 'border-white/12 bg-white/6 text-slate-200';
   if (ms <= 300) return 'border-mint-400/30 bg-mint-400/12 text-mint-200';
@@ -1580,8 +1694,39 @@ function compactRevision(rawValue = '') {
 }
 
 function formatLatency(latencyMs) {
+  if (latencyMs === null || latencyMs === undefined || String(latencyMs).trim() === '') return '未探测';
   const ms = Number(latencyMs);
   return Number.isFinite(ms) ? `${Math.round(ms)} ms` : '未探测';
+}
+
+function normalizeLineProbe(line = {}) {
+  const probe = isPlainObject(line?.probe) ? line.probe : {};
+  const reason = String(probe.reason || '').trim().toLowerCase();
+  const statusCode = Number(probe.statusCode);
+  const elapsedValue = Number(probe.elapsedMs ?? line?.latencyMs);
+  const hasElapsed = probe.elapsedMs !== null
+    && probe.elapsedMs !== undefined
+    && Number.isFinite(elapsedValue)
+    && elapsedValue >= 0;
+  const ok = probe.ok === true || (!reason && normalizeLatencyNumber(line?.latencyMs) !== null);
+  return {
+    ok,
+    reason: ok ? 'ok' : reason || 'network_error',
+    statusCode: Number.isInteger(statusCode) && statusCode >= 100 && statusCode <= 599 ? statusCode : null,
+    elapsedMs: hasElapsed ? Math.round(elapsedValue) : null
+  };
+}
+
+function formatLineProbe(line = {}) {
+  if (!isPlainObject(line?.probe)) return formatLatency(line?.latencyMs);
+  const probe = normalizeLineProbe(line);
+  const elapsed = probe.elapsedMs === null ? '' : ` · ${probe.elapsedMs} ms`;
+  if (probe.ok) return probe.elapsedMs === null ? '探测正常' : `${probe.elapsedMs} ms`;
+  if (probe.reason === 'http_error') return `HTTP ${probe.statusCode || '错误'}${elapsed}`;
+  if (probe.reason === 'timeout') return `超时${elapsed}`;
+  if (probe.reason === 'tls_error') return `TLS 错误${elapsed}`;
+  if (probe.reason === 'invalid_target') return '目标无效';
+  return `网络错误${elapsed}`;
 }
 
 function formatDateTime(rawValue = '') {
@@ -1643,6 +1788,15 @@ async function copyText(text = '') {
         <div class="inline-flex rounded-full border px-3 py-1 text-xs font-semibold" :class="resolveStatusTone()">
           {{ resolveStatusLabel() }}
         </div>
+        <button
+          type="button"
+          class="secondary-btn"
+          :disabled="globalHeadProbePending || loadingNodes || savingNode || importingNodes || !nodes.length"
+          @click="handleGlobalHeadProbe"
+        >
+          <Activity class="h-4 w-4" :class="{ 'animate-pulse': globalHeadProbePending }" />
+          {{ globalHeadProbePending ? 'GET 测试中' : '全局 GET 测试' }}
+        </button>
         <button
           type="button"
           class="secondary-btn"
@@ -1937,7 +2091,7 @@ async function copyText(text = '') {
             </p>
           </div>
 
-          <div class="flex flex-wrap gap-3">
+          <div class="flex w-full min-w-0 flex-wrap gap-3 lg:w-auto">
             <button
               type="button"
               class="secondary-btn"
@@ -2011,7 +2165,9 @@ async function copyText(text = '') {
           class="mt-5 rounded-2xl border px-4 py-4"
           :class="editorRuntime.actionTone === 'success'
             ? 'border-mint-400/25 bg-mint-400/10 text-mint-100'
-            : 'border-rose-400/25 bg-rose-500/10 text-rose-100'"
+            : editorRuntime.actionTone === 'warning'
+              ? 'border-amber-300/25 bg-amber-500/10 text-amber-50'
+              : 'border-rose-400/25 bg-rose-500/10 text-rose-100'"
         >
           <p class="text-sm leading-6">{{ editorRuntime.actionText }}</p>
         </article>
@@ -2451,9 +2607,9 @@ async function copyText(text = '') {
                 </span>
                 <span
                   class="inline-flex rounded-full border px-2.5 py-1 text-[11px] font-medium"
-                  :class="resolveLatencyTone(line.latencyMs)"
+                  :class="resolveLatencyTone(line.latencyMs, line)"
                 >
-                  {{ formatLatency(line.latencyMs) }}
+                  {{ formatLineProbe(line) }}
                 </span>
                 <span
                   v-if="resolveLineProbeMeta(line)"
@@ -2537,9 +2693,9 @@ async function copyText(text = '') {
 
           <div
             class="inline-flex rounded-full border px-3 py-1 text-xs font-semibold"
-            :class="resolveLatencyTone(resolveActiveLine(node)?.latencyMs)"
+            :class="resolveLatencyTone(resolveActiveLine(node)?.latencyMs, resolveActiveLine(node))"
           >
-            {{ formatLatency(resolveActiveLine(node)?.latencyMs) }}
+            {{ formatLineProbe(resolveActiveLine(node)) }}
           </div>
         </div>
 
@@ -2625,9 +2781,9 @@ async function copyText(text = '') {
                     </div>
                     <div
                       class="inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold"
-                      :class="resolveLatencyTone(line.latencyMs)"
+                      :class="resolveLatencyTone(line.latencyMs, line)"
                     >
-                      {{ formatLatency(line.latencyMs) }}
+                      {{ formatLineProbe(line) }}
                     </div>
                     <div
                       v-if="resolveLineProbeMeta(line)"

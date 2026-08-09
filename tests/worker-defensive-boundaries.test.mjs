@@ -429,7 +429,7 @@ test("node probes preserve target base paths and require a successful response",
     "https://origin.example/proxy/emby/emby/system/ping"
   );
 
-  const responses = [404, 204, 405, 204, 501, 503, 503];
+  const responses = [404, 204, 503];
   const requests = [];
   await withWorkerGlobals({
     fetch: async (url, init = {}) => {
@@ -437,28 +437,37 @@ test("node probes preserve target base paths and require a successful response",
       return new Response(null, { status: responses.shift() });
     }
   }, async () => {
-    assert.equal(await kernel.pingTarget("https://origin.example/emby", 1000), 9999);
-    const successLatency = await kernel.pingTarget("https://origin.example", 1000, {
-      probePath: "/emby/System/Info/Public"
+	const notFound = await kernel.pingTarget("https://origin.example/emby", 1000);
+	assert.equal(notFound.ok, false);
+	assert.equal(notFound.reason, "http_error");
+	assert.equal(notFound.statusCode, 404);
+	assert.equal(notFound.methodUsed, "GET");
+	const success = await kernel.pingTarget("https://origin.example", 1000, {
+      probePath: "/emby/system/ping"
     });
-    assert.ok(successLatency >= 0 && successLatency < 9999);
-    const fallbackLatency = await kernel.pingTarget("https://origin.example/emby", 1000);
-    assert.ok(fallbackLatency >= 0 && fallbackLatency < 9999);
-    assert.equal(await kernel.pingTarget("https://origin.example/emby", 1000), 9999);
-    assert.equal(await kernel.pingTarget("https://origin.example/emby", 1000), 9999);
+	assert.equal(success.ok, true);
+	assert.equal(success.reason, "ok");
+	assert.equal(success.statusCode, 204);
+	assert.equal(success.methodUsed, "GET");
+	assert.equal(success.probePath, "/emby/system/info/public");
+	assert.ok(success.elapsedMs >= 0);
+	const unavailable = await kernel.pingTarget("https://origin.example/emby", 1000);
+	assert.equal(unavailable.ok, false);
+	assert.equal(unavailable.reason, "http_error");
+	assert.equal(unavailable.statusCode, 503);
+	assert.equal(unavailable.methodUsed, "GET");
   });
   assert.deepEqual(requests, [
-    { url: "https://origin.example/emby/system/info/public", method: "HEAD" },
-    { url: "https://origin.example/emby/System/Info/Public", method: "HEAD" },
-    { url: "https://origin.example/emby/system/info/public", method: "HEAD" },
     { url: "https://origin.example/emby/system/info/public", method: "GET" },
-    { url: "https://origin.example/emby/system/info/public", method: "HEAD" },
     { url: "https://origin.example/emby/system/info/public", method: "GET" },
-    { url: "https://origin.example/emby/system/info/public", method: "HEAD" }
+    { url: "https://origin.example/emby/system/info/public", method: "GET" }
   ]);
 });
 
-test("failover probes reuse the base-aware probe URL and accept all 2xx responses", async () => {
+test("failover probes prefer GET by default and retain the optional HEAD fallback", async () => {
+  assert.equal(Config.Defaults.HedgeProbePreferGet, true);
+  assert.equal(sanitizeRuntimeConfig({}).hedgeProbePreferGet, true);
+  assert.equal(sanitizeRuntimeConfig({ hedgeProbePreferGet: false }).hedgeProbePreferGet, false);
   const originalProbeRequest = proxyService.performFailoverProbeRequest;
   const requests = [];
   proxyService.performFailoverProbeRequest = async (_execution, probeUrl, method) => {
@@ -466,19 +475,95 @@ test("failover probes reuse the base-aware probe URL and accept all 2xx response
     return new Response(null, { status: method === "HEAD" ? 405 : 204 });
   };
   try {
-    const result = await proxyService.runFailoverProbeCandidate({
+    const preferredGetResult = await proxyService.runFailoverProbeCandidate({
       failoverContext: { probePath: "/emby/system/ping", probeTimeoutMs: 1000 }
     }, createTargetRecord("https://origin.example/emby"));
-    assert.equal(result.ok, true);
-    assert.equal(result.status, 204);
-    assert.equal(result.methodUsed, "GET");
+    assert.equal(preferredGetResult.ok, true);
+    assert.equal(preferredGetResult.status, 204);
+    assert.equal(preferredGetResult.methodUsed, "GET");
+
+    const headFallbackResult = await proxyService.runFailoverProbeCandidate({
+      failoverContext: { probePath: "/emby/system/ping", probeTimeoutMs: 1000, probePreferGet: false }
+    }, createTargetRecord("https://origin.example/emby"));
+    assert.equal(headFallbackResult.ok, true);
+    assert.equal(headFallbackResult.status, 204);
+    assert.equal(headFallbackResult.methodUsed, "GET");
     assert.deepEqual(requests, [
+      { url: "https://origin.example/emby/system/ping", method: "GET" },
       { url: "https://origin.example/emby/system/ping", method: "HEAD" },
       { url: "https://origin.example/emby/system/ping", method: "GET" }
     ]);
   } finally {
     proxyService.performFailoverProbeRequest = originalProbeRequest;
   }
+});
+
+test("node GET probes use the fixed public-info path with a ten second default", async () => {
+  assert.equal(Config.Defaults.PingTimeoutMs, 10000);
+  const requests = [];
+  await withWorkerGlobals({
+    fetch: async (url, init = {}) => {
+      requests.push({ url: String(url), method: String(init.method || "GET") });
+      return new Response(null, { status: 204 });
+    }
+  }, async () => {
+    const probe = await kernel.pingTarget("https://origin.example/emby", 1000, {
+      probePath: "/emby/system/ping"
+    });
+	assert.equal(probe.ok, true);
+	assert.equal(probe.reason, "ok");
+	assert.equal(probe.statusCode, 204);
+	assert.equal(probe.methodUsed, "GET");
+	assert.equal(probe.probePath, "/emby/system/info/public");
+	assert.ok(probe.elapsedMs >= 0);
+  });
+  assert.deepEqual(requests, [
+    { url: "https://origin.example/emby/system/info/public", method: "GET" }
+  ]);
+});
+
+test("node GET probes distinguish TLS, network, invalid target, and true timeout failures", async () => {
+  let requestCount = 0;
+  await withWorkerGlobals({
+    fetch: async () => {
+      requestCount += 1;
+      if (requestCount === 1) throw new TypeError("TLS certificate handshake failed");
+      throw new TypeError("Network connection lost");
+    }
+  }, async () => {
+    const tlsFailure = await kernel.pingTarget("https://tls.example", 1000);
+    assert.equal(tlsFailure.ok, false);
+    assert.equal(tlsFailure.reason, "tls_error");
+    assert.equal(tlsFailure.statusCode, null);
+    assert.equal(tlsFailure.methodUsed, "GET");
+
+    const networkFailure = await kernel.pingTarget("https://network.example", 1000);
+    assert.equal(networkFailure.ok, false);
+    assert.equal(networkFailure.reason, "network_error");
+    assert.equal(networkFailure.statusCode, null);
+
+    const invalidTarget = await kernel.pingTarget("not-a-url", 1000);
+    assert.equal(invalidTarget.ok, false);
+    assert.equal(invalidTarget.reason, "invalid_target");
+    assert.equal(invalidTarget.methodUsed, null);
+  });
+
+  await withWorkerGlobals({
+    fetch: async (_url, init = {}) => await new Promise((_resolve, reject) => {
+      init.signal?.addEventListener("abort", () => {
+        const error = new Error("aborted");
+        error.name = "AbortError";
+        reject(error);
+      }, { once: true });
+    })
+  }, async () => {
+    const timeoutFailure = await kernel.pingTarget("https://timeout.example", 5);
+    assert.equal(timeoutFailure.ok, false);
+    assert.equal(timeoutFailure.reason, "timeout");
+    assert.equal(timeoutFailure.statusCode, null);
+    assert.equal(timeoutFailure.methodUsed, "GET");
+    assert.ok(timeoutFailure.elapsedMs >= 5);
+  });
 });
 
 test("PlaybackInfo rewrite decodes object sources and removes invalid entries before client delivery", () => {
@@ -1818,6 +1903,70 @@ test("metadata prewarm partitions each target's sensitive query", async () => {
   assert.doesNotMatch(firstPartition, /target-secret|shared-header-secret|shared-session/);
 });
 
+test("metadata prewarm single-flight has four slots and always releases failed entries", async () => {
+  const tasks = isolateState.MetadataPrewarmTasks;
+  tasks.clear();
+  const gate = createDeferred();
+  let started = 0;
+  const flights = Array.from({ length: 4 }, (_, index) => proxyService.runMetadataPrewarmSingleFlight(
+    new Request(`https://cache.test/asset-${index}`),
+    async () => {
+      started += 1;
+      await gate.promise;
+      return { cached: true, bytes: 1 };
+    }
+  ));
+  await Promise.resolve();
+  assert.equal(started, 4);
+  assert.equal(tasks.size, 4);
+
+  const rejectedForCapacity = await proxyService.runMetadataPrewarmSingleFlight(
+    new Request("https://cache.test/asset-5"),
+    async () => ({ cached: true, bytes: 1 })
+  );
+  assert.equal(rejectedForCapacity.skipped, true);
+  const joined = proxyService.runMetadataPrewarmSingleFlight(
+    new Request("https://cache.test/asset-0"),
+    async () => assert.fail("same final cache key must join the active task")
+  );
+
+  gate.resolve();
+  const joinedResult = await joined;
+  await Promise.all(flights);
+  assert.equal(joinedResult.joined, true);
+  assert.equal(tasks.size, 0);
+
+  await assert.rejects(proxyService.runMetadataPrewarmSingleFlight(
+    new Request("https://cache.test/failure"),
+    async () => { throw new Error("prewarm failed"); }
+  ), /prewarm failed/);
+  assert.equal(tasks.size, 0);
+});
+
+test("metadata prewarm byte guards cancel declared and streaming overages", async () => {
+  let declaredCancelled = false;
+  const declaredResponse = new Response(new ReadableStream({
+    cancel() { declaredCancelled = true; }
+  }), { headers: { "Content-Length": "9" } });
+  assert.equal(proxyService.buildBudgetedPrewarmResponse(declaredResponse, 8), null);
+  await Promise.resolve();
+  assert.equal(declaredCancelled, true);
+
+  let streamingCancelled = false;
+  const streamingResponse = new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array(5));
+      controller.enqueue(new Uint8Array(5));
+    },
+    cancel() { streamingCancelled = true; }
+  }));
+  const bounded = proxyService.buildBudgetedPrewarmResponse(streamingResponse, 8);
+  await assert.rejects(bounded.response.arrayBuffer(), /metadata_prewarm_budget_exceeded/);
+  assert.equal(streamingCancelled, true);
+  assert.equal(bounded.getBytes(), 5);
+  assert.equal(sanitizeRuntimeConfig({ prewarmPrefetchBytes: 64 * 1024 * 1024 }).prewarmPrefetchBytes, 8 * 1024 * 1024);
+});
+
 test("metadata cache policy revisions change with TTL and asset kind", () => {
   const imageHour = buildWorkerMetadataCachePolicyRevision("/Items/1/Images/Primary", {
     imageCacheMaxAge: 3600,
@@ -1834,6 +1983,16 @@ test("metadata cache policy revisions change with TTL and asset kind", () => {
 
   assert.notEqual(imageHour, imageDisabled);
   assert.notEqual(imageHour, manifest);
+});
+
+test("managed response idle timeouts cover manifests and segments only", () => {
+  assert.equal(proxyService.resolveResponseStreamIdleTimeoutMs({ isManifest: true }), 12_000);
+  assert.equal(proxyService.resolveResponseStreamIdleTimeoutMs({ isSegment: true }), 15_000);
+  assert.equal(proxyService.resolveResponseStreamIdleTimeoutMs({}), 0);
+  const upstreamState = { response: new Response("body") };
+  assert.equal(proxyService.shouldManageProxyResponseBody({ requestMethod: "GET", requestTraits: { isManifest: true } }, upstreamState), true);
+  assert.equal(proxyService.shouldManageProxyResponseBody({ requestMethod: "GET", requestTraits: { isSegment: true } }, upstreamState), true);
+  assert.equal(proxyService.shouldManageProxyResponseBody({ requestMethod: "GET", requestTraits: {} }, upstreamState), false);
 });
 
 test("metadata cache lookups preserve supported request conditions and bypass If-Range", () => {
@@ -2510,6 +2669,288 @@ test("invalid global host-prefix CNAME targets are rejected before persistence",
   }
 });
 
+test("host-prefix node write entrypoints reject incomplete DNS configuration before mutation", async () => {
+  const entrypoints = [
+    {
+      name: "save",
+      invoke(config, context) {
+        return adminActions.saveOrImport({
+          name: "alpha",
+          target: "https://origin.test",
+          entryMode: "host_prefix"
+        }, { ...context, action: "save" });
+      }
+    },
+    {
+      name: "node-import",
+      invoke(config, context) {
+        return adminActions.saveOrImport({
+          nodes: [{ name: "alpha", target: "https://origin.test", entryMode: "host_prefix" }]
+        }, { ...context, action: "import" });
+      }
+    },
+    {
+      name: "full-import",
+      invoke(config, context) {
+        return adminActions.importFull({
+          config,
+          nodes: [{ name: "alpha", target: "https://origin.test", entryMode: "host_prefix" }]
+        }, context);
+      }
+    }
+  ];
+  const requiredConfig = { cfZoneId: "zone-id", cfApiToken: "api-token" };
+
+  for (const entrypoint of entrypoints) {
+    for (const missingField of ["HOST", "cfZoneId", "cfApiToken"]) {
+      const config = { ...requiredConfig };
+      if (missingField !== "HOST") delete config[missingField];
+      const { kv, storedValues, putKeys, deleteKeys } = createInMemoryKvStore({
+        [kernel.CONFIG_KEY]: config
+      });
+      const env = {
+        ENI_KV: kv,
+        ...(missingField === "HOST" ? {} : { HOST: "proxy.example" }),
+        __CONFIG_CACHE_NAMESPACE: `host-prefix-required-${entrypoint.name}-${missingField}`
+      };
+      invalidateRuntimeConfigCache();
+
+      try {
+        await assert.rejects(
+          entrypoint.invoke(config, { env, ctx: null, kv }),
+          error => error?.code === "HOST_PREFIX_DNS_CONFIG_REQUIRED"
+            && error?.status === 400
+            && error?.details?.missingFields?.includes(missingField)
+        );
+        assert.equal(storedValues.has(`${kernel.PREFIX}alpha`), false);
+        assert.deepEqual(putKeys, []);
+        assert.deepEqual(deleteKeys, []);
+      } finally {
+        invalidateRuntimeConfigCache();
+      }
+    }
+  }
+});
+
+test("node imports reject an oversized batch atomically before KV mutation", async () => {
+  const { kv, storedValues, putKeys, deleteKeys } = createInMemoryKvStore({
+    [kernel.CONFIG_KEY]: {},
+    [`${kernel.PREFIX}existing`]: { target: "https://existing.test", lines: [{ id: "line-1", target: "https://existing.test" }] }
+  });
+  const response = await adminActions.saveOrImport({
+    nodes: [
+      { name: "valid", target: "https://valid.test", lines: [{ id: "line-1", target: "https://valid.test" }] },
+      { name: "oversized", target: "https://origin.test", lines: [{ id: "line-1", target: "https://origin.test" }], remark: "界".repeat(1400) }
+    ]
+  }, { action: "import", env: { ENI_KV: kv }, ctx: null, kv });
+  const payload = await response.json();
+
+  assert.equal(response.status, 400);
+	assert.equal(payload.error.code, "NODE_RESOURCE_LIMIT_EXCEEDED");
+	assert.equal(payload.error.details.nodeName, "oversized");
+	assert.equal(payload.error.details.field, "remark");
+	assert.ok(payload.error.details.actual > payload.error.details.limit);
+  assert.equal(storedValues.has(`${kernel.PREFIX}valid`), false);
+  assert.equal(storedValues.has(`${kernel.PREFIX}oversized`), false);
+  assert.deepEqual(putKeys, []);
+  assert.deepEqual(deleteKeys, []);
+});
+
+test("host-prefix node writes reject malformed HOST without reflecting its value", async () => {
+  const invalidHosts = [
+    "https://proxy.example/",
+    "user@proxy.example",
+    "proxy.example:443",
+    "proxy.example/path",
+    "proxy.example?query=1",
+    "proxy.example#fragment",
+    "*.proxy.example",
+    "proxy_example",
+    "proxy..example",
+    "192.0.2.1"
+  ];
+
+  for (const [index, HOST] of invalidHosts.entries()) {
+    const { kv, storedValues, putKeys } = createInMemoryKvStore({
+      [kernel.CONFIG_KEY]: { cfZoneId: "zone-id", cfApiToken: "api-token" }
+    });
+    const env = {
+      ENI_KV: kv,
+      HOST,
+      __CONFIG_CACHE_NAMESPACE: `host-prefix-invalid-host-${index}`
+    };
+    invalidateRuntimeConfigCache();
+
+    try {
+      await assert.rejects(
+        adminActions.saveOrImport({
+          name: "alpha",
+          target: "https://origin.test",
+          entryMode: "host_prefix"
+        }, { action: "save", env, ctx: null, kv }),
+        error => error?.code === "HOST_PREFIX_HOST_INVALID"
+          && error?.status === 400
+          && error?.details?.field === "HOST"
+          && !Object.values(error.details).includes(HOST)
+      );
+      assert.equal(storedValues.has(`${kernel.PREFIX}alpha`), false);
+      assert.deepEqual(putKeys, []);
+    } finally {
+      invalidateRuntimeConfigCache();
+    }
+  }
+});
+
+test("enabling host-prefix proxy rejects malformed HOST before config persistence", async () => {
+  const { kv, storedValues, putKeys } = createInMemoryKvStore({
+    [kernel.CONFIG_KEY]: { enableHostPrefixProxy: false, cfZoneId: "zone-id", cfApiToken: "api-token" }
+  });
+  const env = {
+    ENI_KV: kv,
+    HOST: "https://proxy.example/",
+    __CONFIG_CACHE_NAMESPACE: "host-prefix-invalid-host-config-enable"
+  };
+  invalidateRuntimeConfigCache();
+
+  try {
+    await assert.rejects(
+      kernel.persistRuntimeConfig({
+        enableHostPrefixProxy: true,
+        cfZoneId: "zone-id",
+        cfApiToken: "api-token"
+      }, { env, kv }),
+      error => error?.code === "HOST_PREFIX_HOST_INVALID"
+        && error?.status === 400
+        && error?.details?.field === "HOST"
+    );
+    assert.equal(JSON.parse(storedValues.get(kernel.CONFIG_KEY)).enableHostPrefixProxy, false);
+    assert.deepEqual(putKeys, []);
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
+test("host-prefix HOST canonicalization accepts case whitespace and one trailing dot", async () => {
+  const { kv, storedValues } = createInMemoryKvStore({
+    [kernel.CONFIG_KEY]: { cfZoneId: "zone-id", cfApiToken: "api-token" }
+  });
+  const env = {
+    ENI_KV: kv,
+    HOST: " Proxy.Example. ",
+    __CONFIG_CACHE_NAMESPACE: "host-prefix-host-canonicalization"
+  };
+  const dns = createCloudflareDnsFetch();
+  invalidateRuntimeConfigCache();
+
+  try {
+    const response = await withWorkerGlobals({ fetch: dns.fetch }, () => adminActions.saveOrImport({
+      name: "alpha",
+      target: "https://origin.test",
+      entryMode: "host_prefix"
+    }, { action: "save", env, ctx: null, kv }));
+    assert.equal(response.status, 200);
+    assert.equal(JSON.parse(storedValues.get(`${kernel.PREFIX}alpha`)).entryMode, "host_prefix");
+    assert.deepEqual(getComparableDnsRecords(dns.records), [{
+      name: "alpha.proxy.example",
+      type: "CNAME",
+      content: "proxy.example",
+      ttl: 1,
+      proxied: false
+    }]);
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
+test("partial host-prefix updates require readiness while downgrade remains available", async () => {
+  const { kv, storedValues } = createInMemoryKvStore({
+    [kernel.CONFIG_KEY]: { cfZoneId: "zone-id", cfApiToken: "api-token" },
+    [`${kernel.PREFIX}alpha`]: { target: "https://old-origin.test", entryMode: "host_prefix" }
+  });
+  const env = {
+    ENI_KV: kv,
+    __CONFIG_CACHE_NAMESPACE: "host-prefix-partial-update"
+  };
+  invalidateRuntimeConfigCache();
+
+  try {
+    await assert.rejects(
+      adminActions.saveOrImport({
+        name: "alpha",
+        originalName: "alpha",
+        target: "https://new-origin.test"
+      }, { action: "save", env, ctx: null, kv }),
+      error => error?.code === "HOST_PREFIX_DNS_CONFIG_REQUIRED"
+        && error?.details?.missingFields?.includes("HOST")
+    );
+    assert.equal(JSON.parse(storedValues.get(`${kernel.PREFIX}alpha`)).target, "https://old-origin.test");
+
+    const response = await adminActions.saveOrImport({
+      name: "alpha",
+      originalName: "alpha",
+      target: "https://new-origin.test",
+      entryMode: "kv_route"
+    }, { action: "save", env, ctx: null, kv });
+    assert.equal(response.status, 200);
+    assert.equal(JSON.parse(storedValues.get(`${kernel.PREFIX}alpha`)).entryMode, "kv_route");
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
+test("host-prefix shortcut node mutations require DNS readiness", async () => {
+  const { kv, storedValues, putKeys } = createInMemoryKvStore({
+    [kernel.CONFIG_KEY]: { cfZoneId: "zone-id", cfApiToken: "api-token" },
+    [`${kernel.PREFIX}alpha`]: {
+      target: "https://origin.test",
+      entryMode: "host_prefix",
+      mainVideoStreamMode: "inherit"
+    }
+  });
+  const env = {
+    ENI_KV: kv,
+    __CONFIG_CACHE_NAMESPACE: "host-prefix-shortcut-readiness"
+  };
+  invalidateRuntimeConfigCache();
+
+  try {
+    await assert.rejects(
+      adminActions.saveMainVideoStreamPolicyShortcuts({ selectedNodeNames: ["alpha"] }, { env, ctx: null, kv }),
+      error => error?.code === "HOST_PREFIX_DNS_CONFIG_REQUIRED"
+        && error?.details?.missingFields?.includes("HOST")
+    );
+    assert.equal(JSON.parse(storedValues.get(`${kernel.PREFIX}alpha`)).mainVideoStreamMode, "inherit");
+    assert.deepEqual(putKeys, []);
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
+test("full import validates host-prefix nodes with secrets merged from current config", async () => {
+  const currentConfig = { cfZoneId: "zone-id", cfApiToken: "api-token", rateLimitRpm: 10 };
+  const { kv, storedValues } = createInMemoryKvStore({ [kernel.CONFIG_KEY]: currentConfig });
+  const env = {
+    ENI_KV: kv,
+    HOST: "proxy.example",
+    __CONFIG_CACHE_NAMESPACE: "host-prefix-full-import-merged-secrets"
+  };
+  const dns = createCloudflareDnsFetch();
+  invalidateRuntimeConfigCache();
+
+  try {
+    const response = await withWorkerGlobals({ fetch: dns.fetch }, () => adminActions.importFull({
+      config: { cfZoneId: "zone-id", rateLimitRpm: 20 },
+      nodes: [{ name: "alpha", target: "https://origin.test", entryMode: "host_prefix" }]
+    }, { env, ctx: null, kv }));
+    assert.equal(response.status, 200);
+    assert.equal(JSON.parse(storedValues.get(kernel.CONFIG_KEY)).cfApiToken, "api-token");
+    assert.equal(JSON.parse(storedValues.get(`${kernel.PREFIX}alpha`)).entryMode, "host_prefix");
+    assert.equal(getComparableDnsRecords(dns.records)[0]?.name, "alpha.proxy.example");
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
 test("host-prefix CNAME target priority is node then global then HOST", () => {
   const hostRoot = "proxy.example";
   const inheritedNode = { target: "https://origin.test", entryMode: "host_prefix" };
@@ -3130,6 +3571,37 @@ test("node revision refresh coalesces and hot node reads stay in memory", async 
   assert.equal(revisionReadCount, 1);
   isolateState.NodeCache.clear();
   invalidateNodesRevisionCache();
+});
+
+test("oversized legacy nodes remain readable but bypass node and playback hot caches", async () => {
+  const oversizedNode = {
+    target: "https://origin.test",
+    lines: [{ id: "line-1", name: "Primary", target: "https://origin.test" }],
+    remark: "界".repeat(1400)
+  };
+  const { kv, putKeys } = createInMemoryKvStore({
+    [`${kernel.PREFIX}alpha`]: oversizedNode
+  });
+  const state = getNodeBindingCacheState(kv);
+  const waitUntilTasks = [];
+  const env = { ENI_KV: kv };
+  const ctx = { waitUntil(task) { waitUntilTasks.push(task); } };
+
+  const first = await kernel.getNode("alpha", env, ctx);
+  const second = await kernel.getNodeForRead("alpha", env);
+  assert.equal(first.remark, oversizedNode.remark);
+  assert.equal(second.remark, oversizedNode.remark);
+  assert.equal(state.NodeCache.has("alpha"), false);
+  assert.equal(state.PlaybackRouteHotCache.has("alpha"), false);
+  assert.equal(kernel.buildPlaybackRouteHotSnapshot("alpha", first), null);
+  assert.equal(putKeys.includes(`${kernel.PREFIX}alpha`), false);
+  assert.equal(waitUntilTasks.length, 0);
+
+  const summary = kernel.normalizeNodeSummaryPayload("alpha", {
+    ...first,
+    lines: Array.from({ length: 40 }, (_, index) => ({ id: `line-${index}`, target: `https://origin-${index}.test` }))
+  });
+  assert.equal(summary.lines.length, 32);
 });
 
 test("node revision read failures are retried instead of negative-cached", async () => {
@@ -4179,6 +4651,116 @@ test("Worker and HTML update requires both uploaded files", async () => {
   }
 });
 
+test("Worker and HTML update refuses a zone-level script that is not bound to the current host", async () => {
+  const { kv, putKeys } = createInMemoryKvStore({
+    [kernel.CONFIG_KEY]: {
+      cfAccountId: "account-id",
+      cfZoneId: "zone-id",
+      cfApiToken: "api-token"
+    }
+  });
+  const env = { ENI_KV: kv, __CONFIG_CACHE_NAMESPACE: "worker-html-current-host-required" };
+  const requestedUrls = [];
+  invalidateRuntimeConfigCache();
+
+  try {
+    const response = await withWorkerGlobals({
+      fetch: async (input) => {
+        const url = String(input);
+        requestedUrls.push(url);
+        if (url.includes("/workers/domains")) {
+          return Response.json({
+            success: true,
+            result: [{ hostname: "sibling.example", service: "sibling-worker" }]
+          });
+        }
+        if (url.includes("/workers/routes")) {
+          return Response.json({
+            success: true,
+            result: [{ pattern: "sibling.example/*", script: "sibling-worker" }],
+            result_info: { total_pages: 1 }
+          });
+        }
+        throw new Error(`unexpected Cloudflare request: ${url}`);
+      }
+    }, () => adminActions.updateWorkerAndAdminIndex({
+      workerFileName: "worker.js",
+      workerScriptContent: "export default { fetch() { return new Response('current'); } }",
+      indexFileName: "index.html",
+      indexHtml: '<!doctype html><html><body><div id="app"></div></body></html>'
+    }, {
+      env,
+      kv,
+      ctx: null,
+      request: new Request("https://current.example/admin")
+    }));
+    const payload = await response.json();
+
+    assert.equal(response.status, 400);
+    assert.equal(payload.error.code, "WORKER_PLACEMENT_SCRIPT_UNRESOLVED");
+    assert.equal(requestedUrls.some((url) => /workers\/domains\?(?:[^#]*&)?zone_id=zone-id(?:&|$)/.test(url) && !url.includes("hostname=current.example")), false);
+    assert.equal(requestedUrls.some((url) => url.includes("/workers/scripts/")), false);
+    assert.deepEqual(putKeys, []);
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
+test("Worker and HTML update uploads only the script bound to the current host", async () => {
+  const { kv } = createInMemoryKvStore({
+    [kernel.CONFIG_KEY]: {
+      cfAccountId: "account-id",
+      cfZoneId: "zone-id",
+      cfApiToken: "api-token"
+    }
+  });
+  const env = { ENI_KV: kv, __CONFIG_CACHE_NAMESPACE: "worker-html-current-host-only" };
+  const scriptUploads = [];
+  invalidateRuntimeConfigCache();
+
+  try {
+    const response = await withWorkerGlobals({
+      fetch: async (input, init = {}) => {
+        const url = String(input);
+        if (url.includes("/workers/domains")) {
+          return Response.json({
+            success: true,
+            result: [
+              { hostname: "sibling.example", service: "sibling-worker" },
+              { hostname: "current.example", service: "current-worker" }
+            ]
+          });
+        }
+        if (url.includes("/workers/scripts/")) {
+          scriptUploads.push({ url, method: init.method });
+          return Response.json({ success: true, result: {} });
+        }
+        throw new Error(`unexpected Cloudflare request: ${url}`);
+      }
+    }, () => adminActions.updateWorkerAndAdminIndex({
+      workerFileName: "worker.js",
+      workerScriptContent: "export default { fetch() { return new Response('current'); } }",
+      indexFileName: "index.html",
+      indexHtml: '<!doctype html><html><body><div id="app"></div></body></html>'
+    }, {
+      env,
+      kv,
+      ctx: null,
+      request: new Request("https://current.example/admin")
+    }));
+    const payload = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(payload.scriptName, "current-worker");
+    assert.deepEqual(scriptUploads, [{
+      url: "https://api.cloudflare.com/client/v4/accounts/account-id/workers/scripts/current-worker/content",
+      method: "PUT"
+    }]);
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
 test("local index source persists in KV and renders through the same-origin vendor path", async () => {
   const { kv } = createInMemoryKvStore({ "sys:theme": {} });
   const env = { ADMIN_PATH: "/admin", ENI_KV: kv };
@@ -5110,6 +5692,40 @@ test("playback progress relay enforces its bounded session table on insertion", 
   relayMap.clear();
 });
 
+test("playback relay cancellation settles timers and all-active capacity does not evict", async () => {
+  const relayMap = isolateState.PlaybackProgressRelay;
+  relayMap.clear();
+  const waits = [];
+  const entry = proxyService.buildPlaybackProgressRelayEntry(60_000, { waitUntil(task) { waits.push(task); } });
+  entry.pendingSnapshot = { ctx: entry.waitUntilCtx };
+  relayMap.set("scheduled", entry);
+  proxyService.schedulePlaybackProgressRelayFlush("scheduled", entry);
+  assert.equal(waits.length, 1);
+  proxyService.markPlaybackProgressRelayStopped("scheduled", { videoProgressForwardIntervalSec: 3, nodeName: "alpha" });
+  await waits[0];
+  assert.equal(entry.scheduledPromise, null);
+  assert.equal(entry.pendingSnapshot, null);
+
+  relayMap.clear();
+  const maxEntries = Config.Defaults.VideoProgressForwardSessionMax;
+  const activeGate = createDeferred();
+  for (let index = 0; index < maxEntries; index += 1) {
+    const active = proxyService.buildPlaybackProgressRelayEntry(3000, null);
+    active.activeFlushPromise = activeGate.promise;
+    relayMap.set(`active-${index}`, active);
+  }
+  const admitted = proxyService.markPlaybackProgressRelayStopped("new-session", {
+    videoProgressForwardIntervalSec: 3,
+    nodeName: "alpha"
+  });
+  assert.equal(admitted, null);
+  assert.equal(relayMap.size, maxEntries);
+  assert.equal(relayMap.has("active-0"), true);
+  assert.equal(relayMap.has("new-session"), false);
+  activeGate.resolve();
+  relayMap.clear();
+});
+
 test("incremental isolate cleanup covers nonessential proxy-adjacent caches", () => {
   const now = Date.now();
   const staleCases = [
@@ -5259,7 +5875,9 @@ test("D1 schema initialization is single-flight and creates current runtime inde
   assert.equal(dnsRecorder.prepared.filter(record => /CREATE TABLE IF NOT EXISTS dns_ip_pool_items \(/.test(record.sql)).length, 2);
 
   const workerSource = await readFile(new URL("../worker/runtime/application-facades.js", import.meta.url), "utf8");
-  assert.doesNotMatch(workerSource, /ALTER TABLE/i);
+  assert.match(workerSource, /async rebuildD1TableWithShadow/);
+  assert.match(workerSource, /D1_SCHEMA_REPAIR_CONFIRMATION_REQUIRED/);
+  assert.match(workerSource, /ALTER TABLE \$\{quoteSqlIdentifier\(tableName\)\} ADD COLUMN/);
   assert.match(workerSource, /CREATE INDEX IF NOT EXISTS idx_proxy_logs_category_time/);
   assert.match(workerSource, /CREATE INDEX IF NOT EXISTS idx_dns_ip_pool_items_updated_ip/);
 });
@@ -5289,6 +5907,29 @@ test("D1 DNS writes keep stable ids and replace sources atomically", async () =>
   assert.equal(sourceBatch.length, 2);
   assert.match(sourceBatch[0].sql, /^DELETE FROM dns_ip_pool_sources$/);
   assert.match(sourceBatch[1].sql, /^INSERT INTO dns_ip_pool_sources/);
+
+  const bulkItems = Array.from({ length: 250 }, (_, index) => ({
+    id: `item-${index}`,
+    ip: `10.0.0.${index % 250 + 1}`,
+    sourceKind: "manual"
+  }));
+  await kernel.upsertDnsIpPoolItems(recorder.db, bulkItems);
+  assert.equal(recorder.batches.at(-1).length, 1);
+  assert.equal(recorder.batches.at(-1)[0].bindings.length, 1);
+
+  const bulkSources = Array.from({ length: 250 }, (_, index) => ({
+    id: `source-${index}`,
+    name: `Source ${index}`,
+    url: `https://example.test/${index}.txt`,
+    sourceType: "url",
+    sourceKind: "custom",
+    enabled: true,
+    sortOrder: index,
+    ipLimit: 5
+  }));
+  await kernel.persistDnsIpPoolSources({ db: recorder.db }, bulkSources);
+  assert.equal(recorder.batches.at(-1).length, 2);
+  assert.equal(recorder.batches.at(-1)[1].bindings.length, 1);
 });
 
 test("D1 probe cache bulk reads stay within the 100 binding limit", async () => {
